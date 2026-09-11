@@ -1,0 +1,7 @@
+flask
+sounddevice
+soundfile
+numpy
+miniaudio
+yt-dlp
+imageio-ffmpeg

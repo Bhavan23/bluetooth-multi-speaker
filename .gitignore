@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.claude/
+files/
+files.zip
+stdout.txt
+stderr.txt
+*.mp3
+*.wav
+*.flac
+*.ogg
