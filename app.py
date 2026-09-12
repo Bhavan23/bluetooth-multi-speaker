@@ -1360,11 +1360,33 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
   <div class="card">
     <div class="ct">Now Playing</div>
     <div class="now" id="now-title">Waiting for host&hellip;</div>
-    <div class="added" id="now-sub"></div>
-    <audio id="player" controls autoplay></audio>
-    <div class="status">
+
+    <!-- hidden real audio element - controlled by JS only -->
+    <audio id="player" style="display:none"></audio>
+
+    <!-- Tap to listen button (satisfies mobile autoplay policy) -->
+    <div id="tap-area" style="text-align:center;padding:20px 0">
+      <button id="tap-btn" onclick="tapToListen()"
+        style="background:#2563eb;color:#fff;border:none;border-radius:50%;
+               width:72px;height:72px;font-size:28px;cursor:pointer;
+               box-shadow:0 4px 14px rgba(37,99,235,.5)">&#9654;</button>
+      <div style="font-size:12px;color:#64748b;margin-top:8px">Tap to connect audio</div>
+    </div>
+
+    <!-- Volume control (shown after tap) -->
+    <div id="vol-area" style="display:none;margin-top:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:14px">&#128266;</span>
+        <input type="range" id="j-vol" min="0" max="100" value="80"
+               oninput="document.getElementById('player').volume=this.value/100"
+               style="flex:1;cursor:pointer">
+        <span id="j-vol-pct" style="font-size:12px;color:#64748b;width:34px">80%</span>
+      </div>
+    </div>
+
+    <div class="status" style="margin-top:12px">
       <span class="dot" id="dot"></span>
-      <span id="status-txt">Connecting&hellip;</span>
+      <span id="status-txt">Tap the button above to connect</span>
     </div>
   </div>
 
@@ -1402,7 +1424,20 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
 <script>
 const CODE = "{{ code }}";
 const player = document.getElementById('player');
-let _playing = false, _streamTs = 0;
+let _playing = false, _streamTs = 0, _tapped = false;
+
+function tapToListen() {
+  _tapped = true;
+  document.getElementById('tap-btn').style.background = '#16a34a';
+  document.getElementById('tap-btn').innerHTML = '&#10003;';
+  document.getElementById('tap-area').querySelector('div').textContent = 'Connected — waiting for host';
+  document.getElementById('vol-area').style.display = 'block';
+  document.getElementById('j-vol').addEventListener('input', function(){
+    document.getElementById('j-vol-pct').textContent = this.value + '%';
+  });
+  // if host is already playing, start immediately
+  pollState();
+}
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function showMsg(html,type){const el=document.getElementById('j-msg');el.innerHTML=html;el.className='msg '+type;el.style.display='block'}
@@ -1484,8 +1519,9 @@ async function pollState(){
     dot.className='dot';dot.style.background='#f59e0b';
     st.textContent='Meeting in progress';
     nowTitle.textContent='Meeting mode on';
-  } else if(data.playing&&!_playing){
+  } else if(data.playing&&!_playing&&_tapped){
     _playing=true;_streamTs=Date.now();
+    document.getElementById('tap-area').querySelector('div').textContent='Now playing';
     player.src='/room/'+CODE+'/stream?t='+_streamTs;
     player.play().catch(()=>{});
     dot.className='dot live';dot.style.background='';
