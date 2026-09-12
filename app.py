@@ -551,6 +551,7 @@ def api_room_state(code):
     return jsonify({
         "code": code,
         "playing": room["playing"],
+        "paused": room.get("paused", False),
         "current_idx": idx,
         "current_title": current_title,
         "member_count": mc,
@@ -668,7 +669,31 @@ def api_room_stop(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
     _room_stop_internal(code)
+    _rooms[code]["paused"] = False
     return jsonify({"message": "Stopped."})
+
+
+@app.route("/api/room/<code>/pause", methods=["POST"])
+def api_room_pause(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    _room_stop_internal(code)
+    _rooms[code]["paused"] = True
+    return jsonify({"message": "Room paused — meeting mode on."})
+
+
+@app.route("/api/room/<code>/resume", methods=["POST"])
+def api_room_resume(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    if not room["queue"]:
+        return jsonify({"error": "Queue is empty."}), 400
+    room["paused"] = False
+    _room_no_advance.discard(code)
+    _room_start_item(code, room["current_idx"])
+    return jsonify({"message": "Resumed."})
+
 
 
 # ── Room HTTP stream ───────────────────────────────────────────────────────────
@@ -905,10 +930,17 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
     <div class="card">
       <div class="ct">Controls</div>
       <div id="r-now" style="font-size:14px;font-weight:600;color:#1e293b;margin-bottom:12px;min-height:20px">—</div>
-      <div class="btns">
+      <div class="btns" style="margin-bottom:10px">
         <button class="btn bgr" onclick="rPlay()">&#9654; Play</button>
         <button class="btn bam" onclick="rSkip()">&#9197; Skip</button>
-        <button class="btn br"  onclick="rStop()">&#9646;&#9646; Stop</button>
+        <button class="btn br"  onclick="rStopRoom()">&#9646;&#9646; Stop Room</button>
+      </div>
+      <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
+        <button class="btn" id="r-meeting-btn" onclick="rToggleMeeting()"
+          style="background:#f59e0b;color:#fff;width:100%;font-size:13px">
+          &#127908; Meeting Mode &mdash; Off
+        </button>
+        <div class="hint">Pauses audio for everyone in the room. Press again to resume.</div>
       </div>
     </div>
 
@@ -1060,10 +1092,30 @@ async function rSkip() {
   const { ok, data } = await api('/api/room/'+_rCode+'/skip', {method:'POST'});
   showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
 }
-async function rStop() {
+async function rStopRoom() {
   if (!_rCode) return;
   const { ok, data } = await api('/api/room/'+_rCode+'/stop', {method:'POST'});
   showMsg('msg-room', esc(data.message||(ok?'Stopped.':'Error.')), ok?'ok':'err');
+  setMeetingBtn(false);
+}
+let _meetingOn = false;
+async function rToggleMeeting() {
+  if (!_rCode) return;
+  if (!_meetingOn) {
+    const { ok, data } = await api('/api/room/'+_rCode+'/pause', {method:'POST'});
+    if (ok) { _meetingOn = true; setMeetingBtn(true); showMsg('msg-room', esc(data.message), 'warn'); }
+    else showMsg('msg-room', esc(data.error||'Failed.'), 'err');
+  } else {
+    const { ok, data } = await api('/api/room/'+_rCode+'/resume', {method:'POST'});
+    if (ok) { _meetingOn = false; setMeetingBtn(false); showMsg('msg-room', esc(data.message), 'ok'); }
+    else showMsg('msg-room', esc(data.error||'Failed.'), 'err');
+  }
+}
+function setMeetingBtn(on) {
+  const btn = $('r-meeting-btn');
+  if (!btn) return;
+  btn.style.background = on ? '#dc2626' : '#f59e0b';
+  btn.innerHTML = on ? '&#127908; Meeting Mode &mdash; ON (tap to resume)' : '&#127908; Meeting Mode &mdash; Off';
 }
 async function rAddFile() {
   if (!_rCode) return;
@@ -1122,9 +1174,11 @@ async function pollState() {
   if (!ok) return;
   $('r-members').textContent = data.member_count || 0;
   const dot = $('r-dot'), st = $('r-status');
+  const label = data.paused ? 'Meeting mode' : data.playing ? ('Playing: ' + (data.current_title||'')) : 'Stopped';
   dot.className = 'status-dot' + (data.playing ? ' live' : '');
-  st.textContent = data.playing ? ('Playing: ' + (data.current_title||'')) : 'Stopped';
+  st.textContent = label;
   $('r-now').textContent = data.current_title || '—';
+  if (data.paused !== _meetingOn) { _meetingOn = data.paused; setMeetingBtn(data.paused); }
   renderQueue(data.queue, data.current_idx, data.playing);
 }
 function startPoll() {
@@ -1283,23 +1337,28 @@ async function pollState(){
 
   renderQueue(data.queue,data.current_idx,data.playing);
 
-  if(data.playing&&!_playing){
+  if(data.paused){
+    if(_playing){_playing=false;player.src='';}
+    dot.className='dot';
+    dot.style.background='#f59e0b';
+    st.textContent='Meeting in progress — music paused';
+    nowTitle.textContent='&#127908; Meeting mode on';
+  } else if(data.playing&&!_playing){
     _playing=true;_streamTs=Date.now();
     player.src='/room/'+CODE+'/stream?t='+_streamTs;
     player.play().catch(()=>{});
-    dot.className='dot live';st.textContent='Live';
+    dot.className='dot live';dot.style.background='';
+    st.textContent='Live';
     nowTitle.textContent=data.current_title||'Now playing';
   } else if(!data.playing&&_playing){
     _playing=false;player.src='';
-    dot.className='dot';st.textContent='Waiting for host&hellip;';
+    dot.className='dot';dot.style.background='';
+    st.textContent='Waiting for host…';
     nowTitle.textContent='Waiting for host…';
   } else if(data.playing){
     nowTitle.textContent=data.current_title||'Now playing';
-    st.textContent='Live';
-    // reconnect if audio stalled
-    if(player.paused&&!player.ended){
-      player.play().catch(()=>{});
-    }
+    dot.style.background='';st.textContent='Live';
+    if(player.paused&&!player.ended){player.play().catch(()=>{});}
   }
 }
 
