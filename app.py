@@ -1,7 +1,7 @@
 """
 Multi-Speaker Player
-- Single Host: play to local Bluetooth speakers via sounddevice
-- Room: stream audio over HTTP so any browser on the network can listen
+Single Host : local Bluetooth speakers via sounddevice
+Room        : shared queue + HTTP MP3 stream to any browser on the same WiFi
 Run: python app.py
 """
 import os
@@ -16,12 +16,13 @@ import time
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from flask import Flask, Response, jsonify, render_template_string, request, stream_with_context
+from flask import (Flask, Response, jsonify, render_template_string,
+                   request, stream_with_context)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
-# ── Single-host state ─────────────────────────────────────────────────────────
+# ── Single-host state ──────────────────────────────────────────────────────────
 _uploaded_path = None
 _is_stream     = False
 _stream_url    = None
@@ -35,37 +36,49 @@ _BASE_SR = 48000
 _BASE_CH = 2
 _CHUNK   = 4096
 
-# ── Room state ────────────────────────────────────────────────────────────────
-_rooms        = {}   # code -> {playing, title, member_count, created_at}
-_room_queues  = {}   # code -> [Queue, ...]  one per connected streaming client
-_room_ffmpeg  = {}   # code -> Popen
-_room_reader  = {}   # code -> Thread
-_room_lock    = threading.Lock()
+# ── Room state ─────────────────────────────────────────────────────────────────
+# _rooms[code] = {
+#   code, playing, current_idx,
+#   queue: [{id, title, source("file"|"youtube"), path, url, added_by}],
+#   created_at
+# }
+_rooms          = {}
+_room_clients   = {}   # code -> [queue.Queue, ...]  one per HTTP listener
+_room_ffmpeg    = {}   # code -> Popen
+_room_readers   = {}   # code -> Thread
+_room_lock      = threading.Lock()
+_room_no_advance = set()   # codes where auto-advance is suppressed
 
 
-# ── Device helpers ────────────────────────────────────────────────────────────
+def _new_id():
+    return f"{int(time.time()*1000)}{random.randint(100,999)}"
+
+
+def _gen_code():
+    return "".join(random.choices(string.ascii_uppercase, k=4))
+
+
+# ── Device helpers ─────────────────────────────────────────────────────────────
 
 def wasapi_devices():
     result = []
     try:
         apis = sd.query_hostapis()
-        wasapi_idx = next((i for i, a in enumerate(apis) if "WASAPI" in a["name"]), None)
+        wasapi_idx = next(
+            (i for i, a in enumerate(apis) if "WASAPI" in a["name"]), None)
         if wasapi_idx is None:
             return result
         for i, dev in enumerate(sd.query_devices()):
             if dev["hostapi"] == wasapi_idx and dev["max_output_channels"] > 0:
-                result.append({
-                    "id": i,
-                    "name": dev["name"],
-                    "channels": int(dev["max_output_channels"]),
-                    "sample_rate": int(dev["default_samplerate"]),
-                })
+                result.append({"id": i, "name": dev["name"],
+                                "channels": int(dev["max_output_channels"]),
+                                "sample_rate": int(dev["default_samplerate"])})
     except Exception as exc:
         print(f"Device query error: {exc}")
     return result
 
 
-# ── Audio helpers ─────────────────────────────────────────────────────────────
+# ── Audio helpers ──────────────────────────────────────────────────────────────
 
 def load_audio(path):
     ext = os.path.splitext(path)[1].lower()
@@ -75,8 +88,7 @@ def load_audio(path):
         except ImportError as e:
             raise RuntimeError("miniaudio required for MP3") from e
         r = miniaudio.mp3_read_file_f32(path)
-        data = np.array(r.samples, dtype=np.float32).reshape(-1, r.nchannels)
-        return data, r.sample_rate
+        return np.array(r.samples, dtype=np.float32).reshape(-1, r.nchannels), r.sample_rate
     data, sr = sf.read(path, dtype="float32", always_2d=True)
     return data, sr
 
@@ -90,8 +102,7 @@ def prepare_audio(data, src_sr, dst_sr, src_ch, dst_ch):
         elif dst_ch < src_ch:
             data = data[:, :dst_ch]
         else:
-            reps = -(-dst_ch // src_ch)
-            data = np.tile(data, (1, reps))[:, :dst_ch]
+            data = np.tile(data, (1, -(-dst_ch // src_ch)))[:, :dst_ch]
     if src_sr != dst_sr:
         n_out = int(round(len(data) * dst_sr / src_sr))
         xi = np.linspace(0, len(data) - 1, n_out)
@@ -106,8 +117,7 @@ def prepare_audio(data, src_sr, dst_sr, src_ch, dst_ch):
 def _find_mme_device(target_name):
     try:
         mme_idx = next(
-            (i for i, a in enumerate(sd.query_hostapis()) if a["name"] == "MME"), None
-        )
+            (i for i, a in enumerate(sd.query_hostapis()) if a["name"] == "MME"), None)
         if mme_idx is None:
             return None
         for i, dev in enumerate(sd.query_devices()):
@@ -132,23 +142,18 @@ def _open_and_start_stream(did, samplerate, channels, callback_fn, dev_name=""):
             (did, dict(extra_settings=ws, latency=0.3,    blocksize=0)),
             (did, dict(extra_settings=ws, latency="high", blocksize=0)),
         ]
-    wasapi_cfgs += [
-        (did, dict(latency=0.5,    blocksize=0)),
-        (did, dict(latency="high", blocksize=0)),
-    ]
-    mme_cfgs = []
+    wasapi_cfgs += [(did, dict(latency=0.5, blocksize=0)),
+                    (did, dict(latency="high", blocksize=0))]
     mme_id = _find_mme_device(dev_name) if dev_name else None
+    mme_cfgs = []
     if mme_id is not None:
         mme_sr = int(sd.query_devices(mme_id)["default_samplerate"])
         mme_ch = min(int(sd.query_devices(mme_id)["max_output_channels"]), channels)
-        mme_cfgs = [
-            (mme_id, dict(latency=0.5,    blocksize=0)),
-            (mme_id, dict(latency="high", blocksize=0)),
-            (mme_id, dict(latency="low",  blocksize=0)),
-        ]
+        mme_cfgs = [(mme_id, dict(latency=0.5, blocksize=0)),
+                    (mme_id, dict(latency="high", blocksize=0)),
+                    (mme_id, dict(latency="low",  blocksize=0))]
     else:
         mme_sr, mme_ch = samplerate, channels
-
     last_exc = None
     for target_id, kw in wasapi_cfgs + mme_cfgs:
         sr = mme_sr if target_id == mme_id else samplerate
@@ -159,11 +164,10 @@ def _open_and_start_stream(did, samplerate, channels, callback_fn, dev_name=""):
                                      dtype="float32", callback=callback_fn, **kw)
             stream.start()
             api = "MME" if target_id == mme_id else "WASAPI"
-            print(f"  [{dev_name}] started via {api} device {target_id} {kw}", flush=True)
+            print(f"  [{dev_name}] started via {api} device {target_id}", flush=True)
             return stream
         except Exception as exc:
             last_exc = exc
-            print(f"  [{dev_name}] device {target_id} {kw} FAILED: {exc}", flush=True)
             if stream:
                 try: stream.close()
                 except Exception: pass
@@ -183,53 +187,41 @@ def close_all_streams():
         _streams.clear()
 
 
-# ── Single-host: YouTube stream playback ──────────────────────────────────────
+# ── Single-host YouTube playback ───────────────────────────────────────────────
 
 def play_stream(selected):
     global _streams, _ffmpeg_proc, _reader_thread
     if not _stream_url:
         return jsonify({"error": "No stream loaded."}), 400
-
     dev_map = {d["id"]: d for d in wasapi_devices()}
-    errors, new_streams = [], []
-    speaker_setup = {}
-
+    errors, new_streams, speaker_setup = [], [], {}
     for sel in selected:
         did = int(sel["id"])
         delay_ms = max(0, int(sel.get("delay_ms", 0) or 0))
         if did not in dev_map:
-            errors.append(f"Device {did} not found.")
-            continue
+            errors.append(f"Device {did} not found."); continue
         dv = dev_map[did]
-        dst_sr = int(dv["sample_rate"])
-        dst_ch = min(int(dv["channels"]), 2)
+        dst_sr, dst_ch = int(dv["sample_rate"]), min(int(dv["channels"]), 2)
         spk_q = queue.Queue(maxsize=500)
         if delay_ms > 0:
-            n_pad = int(delay_ms * dst_sr / 1000)
-            spk_q.put(np.zeros((n_pad, dst_ch), dtype=np.float32))
+            spk_q.put(np.zeros((int(delay_ms * dst_sr / 1000), dst_ch), dtype=np.float32))
 
         def make_stream_cb(q, ch):
             leftover = [np.empty((0, ch), dtype=np.float32)]
             def cb(outdata, frames, _t, status):
                 vol = _volume
-                arr = leftover[0]
-                leftover[0] = np.empty((0, ch), dtype=np.float32)
+                arr = leftover[0]; leftover[0] = np.empty((0, ch), dtype=np.float32)
                 while len(arr) < frames:
                     try:
                         chunk = q.get_nowait()
                         if chunk is None:
                             n = min(len(arr), frames)
-                            outdata[:n] = arr[:n] * vol
-                            outdata[n:] = 0
+                            outdata[:n] = arr[:n] * vol; outdata[n:] = 0
                             raise sd.CallbackStop()
                         arr = np.vstack([arr, chunk]) if len(arr) else chunk
                     except queue.Empty:
-                        n = len(arr)
-                        outdata[:n] = arr * vol
-                        outdata[n:] = 0
-                        return
-                outdata[:] = arr[:frames] * vol
-                leftover[0] = arr[frames:]
+                        n = len(arr); outdata[:n] = arr * vol; outdata[n:] = 0; return
+                outdata[:] = arr[:frames] * vol; leftover[0] = arr[frames:]
             return cb
 
         try:
@@ -239,29 +231,22 @@ def play_stream(selected):
             new_streams.append(stream)
         except Exception as exc:
             errors.append(f'"{dv["name"]}": {exc}')
-
     if not new_streams:
         return jsonify({"error": "Could not start any stream. " + " ".join(errors)}), 500
-
     with _streams_lock:
         _streams.extend(new_streams)
-
     captured_url = _stream_url
-
     def reader():
         global _ffmpeg_proc
         try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            import imageio_ffmpeg; ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except ImportError:
-            for sp in speaker_setup.values(): sp["q"].put(None)
-            return
+            for sp in speaker_setup.values(): sp["q"].put(None); return
         _ffmpeg_proc = subprocess.Popen(
             [ffmpeg_exe, "-reconnect", "1", "-reconnect_streamed", "1",
              "-reconnect_delay_max", "5", "-i", captured_url,
              "-f", "f32le", "-ar", str(_BASE_SR), "-ac", str(_BASE_CH), "pipe:1"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         bytes_per_chunk = _CHUNK * _BASE_CH * 4
         while True:
             raw = _ffmpeg_proc.stdout.read(bytes_per_chunk)
@@ -271,13 +256,11 @@ def play_stream(selected):
             base = np.frombuffer(raw[:n_frames * _BASE_CH * 4],
                                  dtype=np.float32).reshape(-1, _BASE_CH)
             for sp in speaker_setup.values():
-                dst_sr, dst_ch = sp["dst_sr"], sp["dst_ch"]
-                chunk = (base.copy() if dst_sr == _BASE_SR and dst_ch == _BASE_CH
-                         else prepare_audio(base, _BASE_SR, dst_sr, _BASE_CH, dst_ch))
+                chunk = (base.copy() if sp["dst_sr"] == _BASE_SR and sp["dst_ch"] == _BASE_CH
+                         else prepare_audio(base, _BASE_SR, sp["dst_sr"], _BASE_CH, sp["dst_ch"]))
                 try: sp["q"].put(chunk, timeout=2)
                 except queue.Full: pass
         for sp in speaker_setup.values(): sp["q"].put(None)
-
     _reader_thread = threading.Thread(target=reader, daemon=True)
     _reader_thread.start()
     resp = {"message": f'Streaming "{_stream_title}" to {len(new_streams)} speaker(s).'}
@@ -285,31 +268,109 @@ def play_stream(selected):
     return jsonify(resp)
 
 
-# ── Room helpers ──────────────────────────────────────────────────────────────
+# ── Room: core ─────────────────────────────────────────────────────────────────
 
-def _gen_code():
-    return "".join(random.choices(string.ascii_uppercase, k=4))
-
-
-def _get_ffmpeg_exe():
+def _ffmpeg_exe():
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
+def _room_broadcast_stop(code):
+    """Send None sentinel to all connected HTTP clients for a room."""
+    with _room_lock:
+        for q in _room_clients.get(code, []):
+            try: q.put_nowait(None)
+            except Exception: pass
+
+
 def _room_stop_internal(code):
+    """Kill FFmpeg + notify clients. Does NOT auto-advance."""
+    _room_no_advance.add(code)
     proc = _room_ffmpeg.pop(code, None)
     if proc:
         try: proc.kill()
         except Exception: pass
-    with _room_lock:
-        for q in _room_queues.get(code, []):
-            try: q.put_nowait(None)
-            except Exception: pass
+    _room_broadcast_stop(code)
     if code in _rooms:
         _rooms[code]["playing"] = False
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+def _room_start_item(code, idx):
+    """Start playing queue item at idx. Called by play route and auto-advance."""
+    room = _rooms.get(code)
+    if not room:
+        return
+    q = room["queue"]
+    if idx >= len(q):
+        room["playing"] = False
+        return
+
+    item = q[idx]
+    room["current_idx"] = idx
+    room["playing"] = True
+
+    # Build FFmpeg input args
+    if item["source"] == "youtube":
+        ffmpeg_in = ["-reconnect", "1", "-reconnect_streamed", "1",
+                     "-reconnect_delay_max", "5", "-i", item["url"]]
+    else:
+        ffmpeg_in = ["-i", item["path"]]
+
+    try:
+        exe = _ffmpeg_exe()
+    except Exception as exc:
+        print(f"[Room {code}] ffmpeg unavailable: {exc}", flush=True)
+        room["playing"] = False
+        return
+
+    proc = subprocess.Popen(
+        [exe] + ffmpeg_in + ["-f", "mp3", "-ab", "128k", "-ar", "44100", "-ac", "2", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    _room_ffmpeg[code] = proc
+    print(f"[Room {code}] playing #{idx}: {item['title']}", flush=True)
+
+    def reader():
+        try:
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                with _room_lock:
+                    clients = list(_room_clients.get(code, []))
+                for cq in clients:
+                    try: cq.put_nowait(chunk)
+                    except queue.Full: pass
+        finally:
+            # Notify clients this stream ended
+            with _room_lock:
+                clients = list(_room_clients.get(code, []))
+            for cq in clients:
+                try: cq.put_nowait(None)
+                except Exception: pass
+            # Auto-advance unless we were intentionally stopped
+            if code not in _room_no_advance:
+                _room_advance(code)
+            _room_no_advance.discard(code)
+
+    t = threading.Thread(target=reader, daemon=True)
+    _room_readers[code] = t
+    t.start()
+
+
+def _room_advance(code):
+    """Move to next queue item and start playing."""
+    room = _rooms.get(code)
+    if not room or not room.get("playing"):
+        return
+    next_idx = room["current_idx"] + 1
+    if next_idx >= len(room["queue"]):
+        room["playing"] = False
+        print(f"[Room {code}] queue finished.", flush=True)
+        return
+    _room_start_item(code, next_idx)
+
+
+# ── Flask error handler ────────────────────────────────────────────────────────
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -317,12 +378,14 @@ def handle_exception(e):
     return jsonify({"error": str(e)}), 500
 
 
+# ── Main page ──────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
 
 
-# Single-host API ----------------------------------------------------------
+# ── Single Host API ────────────────────────────────────────────────────────────
 
 @app.route("/api/devices")
 def api_devices():
@@ -361,10 +424,9 @@ def api_youtube():
         import yt_dlp
     except ImportError as exc:
         return jsonify({"error": f"Missing: {exc}"}), 500
-    ydl_opts = {"format": "bestaudio/best", "quiet": True,
-                "no_warnings": True, "noplaylist": True}
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True,
+                                "no_warnings": True, "noplaylist": True}) as ydl:
             info = ydl.extract_info(url, download=False)
             title = info.get("title", "Unknown")
             stream_url = info.get("url")
@@ -406,27 +468,23 @@ def api_play():
     dev_map = {d["id"]: d for d in wasapi_devices()}
     errors, new_streams = [], []
     for sel in selected:
-        did = int(sel["id"])
-        delay_ms = max(0, int(sel.get("delay_ms", 0) or 0))
+        did = int(sel["id"]); delay_ms = max(0, int(sel.get("delay_ms", 0) or 0))
         if did not in dev_map:
             errors.append(f"Device {did} not found."); continue
         dv = dev_map[did]
-        dst_sr = int(dv["sample_rate"])
-        dst_ch = min(int(dv["channels"]), 2)
+        dst_sr, dst_ch = int(dv["sample_rate"]), min(int(dv["channels"]), 2)
         try:
             buf = prepare_audio(audio, src_sr, dst_sr, src_ch, dst_ch)
             if delay_ms > 0:
-                n_pad = int(delay_ms * dst_sr / 1000)
-                buf = np.vstack([np.zeros((n_pad, dst_ch), dtype=np.float32), buf])
-            state = {"buf": buf, "pos": 0}
-            lock = threading.Lock()
+                buf = np.vstack([np.zeros((int(delay_ms * dst_sr / 1000), dst_ch),
+                                          dtype=np.float32), buf])
+            state = {"buf": buf, "pos": 0}; lock = threading.Lock()
             def make_cb(s, lk, dev_id=did):
                 def cb(outdata, frames, _time, status):
                     with lk:
                         pos = s["pos"]; b = s["buf"]; vol = _volume
                         remain = len(b) - pos
-                        if remain <= 0:
-                            outdata[:] = 0; raise sd.CallbackStop()
+                        if remain <= 0: outdata[:] = 0; raise sd.CallbackStop()
                         n = min(frames, remain)
                         outdata[:n] = b[pos:pos+n] * vol
                         if n < frames: outdata[n:] = 0
@@ -439,9 +497,8 @@ def api_play():
         except Exception as exc:
             errors.append(f'"{dv["name"]}": {exc}')
     if not new_streams:
-        return jsonify({"error": "Could not start any stream. " + " ".join(errors)}), 500
-    with _streams_lock:
-        _streams.extend(new_streams)
+        return jsonify({"error": "Could not start. " + " ".join(errors)}), 500
+    with _streams_lock: _streams.extend(new_streams)
     resp = {"message": f"Playing on {len(new_streams)} speaker(s)."}
     if errors: resp["warnings"] = errors
     return jsonify(resp)
@@ -462,18 +519,16 @@ def api_volume():
     return jsonify({"message": f"Volume: {v}%"})
 
 
-# Room API -----------------------------------------------------------------
+# ── Room API ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/room/create", methods=["POST"])
 def api_room_create():
     code = _gen_code()
     with _room_lock:
-        while code in _rooms:
-            code = _gen_code()
+        while code in _rooms: code = _gen_code()
         _rooms[code] = {"code": code, "playing": False,
-                        "title": None, "member_count": 0,
-                        "created_at": time.time()}
-        _room_queues[code] = []
+                        "current_idx": 0, "queue": [], "created_at": time.time()}
+        _room_clients[code] = []
     print(f"Room created: {code}", flush=True)
     return jsonify({"code": code})
 
@@ -482,68 +537,125 @@ def api_room_create():
 def api_room_state(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
     with _room_lock:
-        mc = len(_room_queues.get(code, []))
-    r = dict(_rooms[code])
-    r["member_count"] = mc
-    return jsonify(r)
+        mc = len(_room_clients.get(code, []))
+    idx = room["current_idx"]
+    q = room["queue"]
+    current_title = q[idx]["title"] if idx < len(q) else None
+    return jsonify({
+        "code": code,
+        "playing": room["playing"],
+        "current_idx": idx,
+        "current_title": current_title,
+        "member_count": mc,
+        "queue": [{"id": it["id"], "title": it["title"],
+                   "added_by": it["added_by"]} for it in q],
+    })
+
+
+@app.route("/api/room/<code>/queue/add", methods=["POST"])
+def api_room_queue_add(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+
+    added_by = "Host" if request.remote_addr in ("127.0.0.1", "::1") else request.remote_addr
+
+    # File upload
+    if "file" in request.files:
+        f = request.files["file"]
+        if not f or not f.filename:
+            return jsonify({"error": "No file."}), 400
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in (".mp3", ".wav", ".flac", ".ogg"):
+            return jsonify({"error": f'Format "{ext}" not supported.'}), 400
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        f.save(tmp.name); tmp.close()
+        item = {"id": _new_id(), "title": f.filename,
+                "source": "file", "path": tmp.name, "url": None,
+                "added_by": added_by}
+        _rooms[code]["queue"].append(item)
+        return jsonify({"message": f'Added: {f.filename}', "id": item["id"]})
+
+    # YouTube URL
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "Provide a file or YouTube URL."}), 400
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return jsonify({"error": "Not a valid YouTube URL."}), 400
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True,
+                                "no_warnings": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get("title", "YouTube track")
+            stream_url = info.get("url")
+            if not stream_url:
+                fmts = [f for f in info.get("formats", [])
+                        if f.get("url") and f.get("acodec") not in (None, "none")]
+                if not fmts:
+                    fmts = [f for f in info.get("formats", []) if f.get("url")]
+                fmts.sort(key=lambda x: x.get("abr") or x.get("tbr") or 0, reverse=True)
+                stream_url = fmts[0]["url"]
+    except Exception as exc:
+        return jsonify({"error": f"Could not load YouTube: {exc}"}), 500
+    item = {"id": _new_id(), "title": title,
+            "source": "youtube", "path": None, "url": stream_url,
+            "added_by": added_by}
+    _rooms[code]["queue"].append(item)
+    return jsonify({"message": f'Added: {title}', "id": item["id"]})
+
+
+@app.route("/api/room/<code>/queue/remove/<item_id>", methods=["POST"])
+def api_room_queue_remove(code, item_id):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    before = len(room["queue"])
+    new_q = [it for it in room["queue"] if it["id"] != item_id]
+    removed = before - len(new_q)
+    if removed == 0:
+        return jsonify({"error": "Item not found"}), 404
+    # Adjust current_idx if needed
+    removed_idx = next((i for i, it in enumerate(room["queue"]) if it["id"] == item_id), -1)
+    room["queue"] = new_q
+    if removed_idx < room["current_idx"]:
+        room["current_idx"] = max(0, room["current_idx"] - 1)
+    return jsonify({"message": "Removed."})
 
 
 @app.route("/api/room/<code>/play", methods=["POST"])
 def api_room_play(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    if not room["queue"]:
+        return jsonify({"error": "Queue is empty — add a song first."}), 400
     _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    idx = room["current_idx"]
+    if idx >= len(room["queue"]):
+        idx = 0; room["current_idx"] = 0
+    _room_start_item(code, idx)
+    title = room["queue"][idx]["title"]
+    return jsonify({"message": f'Playing: {title}'})
 
-    if _is_stream and _stream_url:
-        ffmpeg_input = ["-reconnect", "1", "-reconnect_streamed", "1",
-                        "-reconnect_delay_max", "5", "-i", _stream_url]
-        title = _stream_title or "YouTube stream"
-    elif _uploaded_path and os.path.exists(_uploaded_path):
-        ffmpeg_input = ["-i", _uploaded_path]
-        title = os.path.basename(_uploaded_path)
-    else:
-        return jsonify({"error": "No song loaded — upload a file or load YouTube first."}), 400
 
-    try:
-        ffmpeg_exe = _get_ffmpeg_exe()
-    except Exception as exc:
-        return jsonify({"error": f"FFmpeg not available: {exc}"}), 500
-
-    proc = subprocess.Popen(
-        [ffmpeg_exe] + ffmpeg_input + [
-            "-f", "mp3", "-ab", "128k", "-ar", "44100", "-ac", "2", "pipe:1"
-        ],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-    _room_ffmpeg[code] = proc
-    _rooms[code]["playing"] = True
-    _rooms[code]["title"] = title
-
-    def reader():
-        try:
-            while True:
-                chunk = proc.stdout.read(8192)
-                if not chunk:
-                    break
-                with _room_lock:
-                    queues = list(_room_queues.get(code, []))
-                for q in queues:
-                    try: q.put_nowait(chunk)
-                    except queue.Full: pass
-        finally:
-            with _room_lock:
-                queues = list(_room_queues.get(code, []))
-            for q in queues:
-                try: q.put_nowait(None)
-                except Exception: pass
-            if code in _rooms:
-                _rooms[code]["playing"] = False
-
-    t = threading.Thread(target=reader, daemon=True)
-    _room_reader[code] = t
-    t.start()
-    return jsonify({"message": f"Streaming '{title}' in room {code}."})
+@app.route("/api/room/<code>/skip", methods=["POST"])
+def api_room_skip(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    next_idx = room["current_idx"] + 1
+    if next_idx >= len(room["queue"]):
+        _room_stop_internal(code)
+        return jsonify({"message": "Queue finished."})
+    _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    room["playing"] = True
+    _room_start_item(code, next_idx)
+    return jsonify({"message": f'Skipped to: {room["queue"][next_idx]["title"]}'})
 
 
 @app.route("/api/room/<code>/stop", methods=["POST"])
@@ -551,16 +663,18 @@ def api_room_stop(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
     _room_stop_internal(code)
-    return jsonify({"message": "Room stopped."})
+    return jsonify({"message": "Stopped."})
 
+
+# ── Room HTTP stream ───────────────────────────────────────────────────────────
 
 @app.route("/room/<code>/stream")
 def room_stream(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
-    client_q = queue.Queue(maxsize=300)
+    client_q = queue.Queue(maxsize=400)
     with _room_lock:
-        _room_queues.setdefault(code, []).append(client_q)
+        _room_clients.setdefault(code, []).append(client_q)
 
     def generate():
         try:
@@ -574,444 +688,428 @@ def room_stream(code):
                     break
         finally:
             with _room_lock:
-                ql = _room_queues.get(code, [])
+                ql = _room_clients.get(code, [])
                 if client_q in ql:
                     ql.remove(client_q)
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype="audio/mpeg",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return Response(stream_with_context(generate()), mimetype="audio/mpeg",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+
+# ── Join page ──────────────────────────────────────────────────────────────────
 
 @app.route("/join/<code>")
 def join_room(code):
     return render_template_string(JOIN_HTML, code=code)
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Multi-Speaker Player</title>
+<title>Speaker Player</title>
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --sidebar-w: 180px;
-  --accent: #2563eb;
-  --bg: #f3f4f6;
-  --card: #fff;
-  --border: #e5e7eb;
-  --text: #111827;
-  --muted: #6b7280;
-}
-body { font-family: Arial,Helvetica,sans-serif; font-size:14px; color:var(--text);
-       background:var(--bg); display:flex; min-height:100vh; }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--sb:180px;--accent:#2563eb;--bg:#f3f4f6;--card:#fff;--border:#e5e7eb;--text:#111827;--muted:#6b7280}
+body{font-family:Arial,Helvetica,sans-serif;font-size:14px;color:var(--text);background:var(--bg);display:flex;min-height:100vh}
 
-/* ── Sidebar ── */
-.sidebar {
-  width: var(--sidebar-w);
-  background: #1e293b;
-  color: #cbd5e1;
-  display: flex;
-  flex-direction: column;
-  padding: 24px 0;
-  flex-shrink: 0;
-}
-.sidebar-logo {
-  font-size: 15px; font-weight: 700; color: #f8fafc;
-  padding: 0 20px 24px; border-bottom: 1px solid #334155; margin-bottom: 16px;
-  line-height: 1.3;
-}
-.sidebar-logo small { display:block; font-size:11px; color:#94a3b8; font-weight:400; margin-top:2px; }
-.nav-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 20px; cursor: pointer;
-  font-size: 13px; font-weight: 500;
-  border-left: 3px solid transparent;
-  transition: background .15s, border-color .15s;
-  user-select: none;
-}
-.nav-item:hover { background: #334155; }
-.nav-item.active { background: #1d4ed8; color: #fff; border-left-color: #60a5fa; }
-.nav-icon { font-size: 16px; }
+/* sidebar */
+.sb{width:var(--sb);background:#1e293b;color:#cbd5e1;display:flex;flex-direction:column;padding:24px 0;flex-shrink:0}
+.sb-logo{font-size:15px;font-weight:700;color:#f8fafc;padding:0 20px 24px;border-bottom:1px solid #334155;margin-bottom:16px;line-height:1.4}
+.sb-logo small{display:block;font-size:11px;color:#94a3b8;font-weight:400;margin-top:2px}
+.nav{display:flex;align-items:center;gap:10px;padding:10px 20px;cursor:pointer;font-size:13px;font-weight:500;border-left:3px solid transparent;transition:background .15s,border-color .15s;user-select:none}
+.nav:hover{background:#334155}
+.nav.active{background:#1d4ed8;color:#fff;border-left-color:#60a5fa}
+.nav-icon{font-size:17px}
 
-/* ── Main content ── */
-.main { flex: 1; padding: 28px 24px; overflow-y: auto; }
-.tab-panel { display: none; max-width: 620px; }
-.tab-panel.active { display: block; }
-h2 { font-size: 18px; font-weight: 700; margin-bottom: 18px; }
+/* main */
+.main{flex:1;padding:28px 24px;overflow-y:auto}
+.panel{display:none;max-width:640px}
+.panel.active{display:block}
+h2{font-size:18px;font-weight:700;margin-bottom:18px}
 
-/* ── Cards ── */
-.card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 8px; padding: 16px; margin-bottom: 14px;
-}
-.card-title {
-  font-size: 11px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .08em; color: var(--muted); margin-bottom: 12px;
-}
+/* cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px}
+.ct{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:12px}
 
-/* ── Device list ── */
-.device-row { display:flex; align-items:center; gap:8px; padding:6px 0;
-              border-bottom:1px solid #f2f2f2; }
-.device-row:last-child { border-bottom:none; }
-.device-label { flex:1; cursor:pointer; }
-.dev-sr { font-size:12px; color:#bbb; margin-left:4px; }
-.delay-wrap { display:flex; align-items:center; gap:4px; white-space:nowrap; }
-.delay-wrap span { font-size:12px; color:var(--muted); }
-.delay-in { width:58px; padding:3px 5px; border:1px solid #ccc;
-            border-radius:3px; text-align:right; font-size:13px; }
+/* device list */
+.drow{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f2f2f2}
+.drow:last-child{border-bottom:none}
+.dlbl{flex:1;cursor:pointer}
+.dsr{font-size:12px;color:#bbb;margin-left:4px}
+.dly{display:flex;align-items:center;gap:4px;white-space:nowrap}
+.dly span{font-size:12px;color:var(--muted)}
+.dly input{width:58px;padding:3px 5px;border:1px solid #ccc;border-radius:3px;text-align:right;font-size:13px}
 
-/* ── Inputs ── */
-.file-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-#song-tag { font-size:13px; color:#16a34a; }
-.text-in {
-  flex:1; min-width:0; padding:7px 10px;
-  border:1px solid #ccc; border-radius:5px; font-size:13px;
-}
-.vol-row { display:flex; align-items:center; gap:10px; }
-#vol-range { width:220px; cursor:pointer; }
-#vol-pct { width:36px; text-align:right; color:var(--muted); }
+/* inputs */
+.frow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.txtin{flex:1;min-width:0;padding:7px 10px;border:1px solid #ccc;border-radius:5px;font-size:13px}
+.vrow{display:flex;align-items:center;gap:10px}
+#vol-range{width:220px;cursor:pointer}
+#vol-pct{width:36px;text-align:right;color:var(--muted)}
 
-/* ── Buttons ── */
-.btns { display:flex; gap:10px; flex-wrap:wrap; }
-.btn { padding:9px 20px; border:none; border-radius:6px; cursor:pointer;
-       font-size:14px; font-weight:600; }
-.btn:hover { filter:brightness(90%); }
-.btn:disabled { opacity:.5; cursor:not-allowed; }
-.btn-blue  { background:#2563eb; color:#fff; }
-.btn-green { background:#16a34a; color:#fff; }
-.btn-red   { background:#dc2626; color:#fff; }
-.btn-gray  { background:#6b7280; color:#fff; }
-.btn-slate { background:#334155; color:#fff; }
+/* buttons */
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+.btn{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
+.btn:hover{filter:brightness(90%)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.bg{background:#6b7280;color:#fff}
+.bb{background:#2563eb;color:#fff}
+.bgr{background:#16a34a;color:#fff}
+.br{background:#dc2626;color:#fff}
+.bsl{background:#334155;color:#fff}
+.bam{background:#7c3aed;color:#fff}
 
-/* ── Messages ── */
-.msg { margin-top:14px; padding:10px 14px; border-radius:6px;
-       font-size:13px; line-height:1.5; display:none; }
-.msg.ok   { background:#dcfce7; color:#14532d; }
-.msg.err  { background:#fee2e2; color:#7f1d1d; }
-.msg.warn { background:#fef9c3; color:#713f12; }
+/* messages */
+.msg{margin-top:12px;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.5;display:none}
+.msg.ok{background:#dcfce7;color:#14532d}
+.msg.err{background:#fee2e2;color:#7f1d1d}
+.msg.warn{background:#fef9c3;color:#713f12}
 
-/* ── Room tab specific ── */
-.room-code-box {
-  font-size: 36px; font-weight: 800; letter-spacing: .2em;
-  color: var(--accent); background: #eff6ff; border: 2px dashed #bfdbfe;
-  border-radius: 8px; padding: 16px 24px; text-align: center;
-  margin: 10px 0;
-}
-.share-link { font-size: 12px; color: var(--muted); word-break: break-all;
-              background: #f9fafb; border: 1px solid var(--border);
-              border-radius: 4px; padding: 6px 10px; margin-top: 6px; }
-.member-badge {
-  display: inline-block; background: #dbeafe; color: #1e40af;
-  border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600;
-}
-.hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
-.section-sep { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+/* room */
+.rcode{font-size:40px;font-weight:900;letter-spacing:.2em;color:var(--accent);background:#eff6ff;border:2px dashed #bfdbfe;border-radius:8px;padding:14px 20px;text-align:center;margin:8px 0}
+.slink{font-size:12px;color:var(--muted);word-break:break-all;background:#f9fafb;border:1px solid var(--border);border-radius:4px;padding:6px 10px;margin-top:4px}
+.badge{display:inline-block;background:#dbeafe;color:#1e40af;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600}
+.hint{font-size:12px;color:var(--muted);margin-top:6px}
+.sep{border:none;border-top:1px solid var(--border);margin:12px 0}
 
-/* ── Responsive ── */
-@media (max-width: 560px) {
-  .sidebar { width: 56px; }
-  .sidebar-logo, .nav-label { display: none; }
-  .nav-item { justify-content: center; padding: 12px; }
-  .main { padding: 16px 12px; }
+/* queue list */
+.qi{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:4px;background:#f9fafb;border:1px solid var(--border)}
+.qi.current{background:#eff6ff;border-color:#bfdbfe}
+.qi-num{font-size:12px;color:var(--muted);width:20px;text-align:right;flex-shrink:0}
+.qi-title{flex:1;font-size:13px;font-weight:500}
+.qi-by{font-size:11px;color:#9ca3af;margin-left:4px}
+.qi-now{font-size:11px;font-weight:700;color:var(--accent);margin-left:4px}
+.qi-rm{background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px;padding:0 4px;line-height:1}
+.qi-rm:hover{color:#b91c1c}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px}
+.status-dot.live{background:#22c55e;animation:pulse 1.2s ease infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+@media(max-width:560px){
+  .sb{width:52px}
+  .sb-logo,.nav-label{display:none}
+  .nav{justify-content:center;padding:12px}
+  .main{padding:16px 10px}
 }
 </style>
 </head>
 <body>
 
-<!-- Sidebar -->
-<nav class="sidebar">
-  <div class="sidebar-logo">
-    Speaker<br>Player
-    <small>Multi-output audio</small>
+<nav class="sb">
+  <div class="sb-logo">Speaker<br>Player<small>Multi-output audio</small></div>
+  <div class="nav active" onclick="switchTab('host',this)">
+    <span class="nav-icon">&#128266;</span><span class="nav-label">Single Host</span>
   </div>
-  <div class="nav-item active" onclick="switchTab('host', this)">
-    <span class="nav-icon">&#128266;</span>
-    <span class="nav-label">Single Host</span>
-  </div>
-  <div class="nav-item" onclick="switchTab('room', this)">
-    <span class="nav-icon">&#127968;</span>
-    <span class="nav-label">Room</span>
+  <div class="nav" onclick="switchTab('room',this)">
+    <span class="nav-icon">&#127968;</span><span class="nav-label">Room</span>
   </div>
 </nav>
 
-<!-- Main -->
 <main class="main">
 
-  <!-- ══ Single Host tab ══ -->
-  <div class="tab-panel active" id="tab-host">
-    <h2>Single Host</h2>
+<!-- ═══ Single Host ═══ -->
+<div class="panel active" id="panel-host">
+  <h2>Single Host</h2>
 
-    <div class="card">
-      <div class="card-title">Speakers</div>
-      <div style="margin-bottom:10px">
-        <button class="btn btn-gray" onclick="loadDevices()">&#8635; Refresh</button>
-      </div>
-      <div id="device-list"><span style="color:#999">Loading&hellip;</span></div>
+  <div class="card">
+    <div class="ct">Speakers</div>
+    <div style="margin-bottom:10px">
+      <button class="btn bg" onclick="loadDevices()">&#8635; Refresh</button>
     </div>
-
-    <div class="card">
-      <div class="card-title">Song &nbsp;<small style="font-size:11px;color:#bbb;font-weight:400;text-transform:none;letter-spacing:0">MP3 &middot; WAV &middot; FLAC &middot; OGG</small></div>
-      <div class="file-row">
-        <input type="file" id="file-in" accept=".mp3,.wav,.flac,.ogg">
-        <button class="btn btn-blue" onclick="uploadFile()">Upload</button>
-        <span id="song-tag"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Or stream from YouTube</div>
-      <div class="file-row">
-        <input class="text-in" type="text" id="yt-url"
-               placeholder="https://www.youtube.com/watch?v=...">
-        <button class="btn btn-red" onclick="loadYoutube()" id="yt-btn">Load</button>
-      </div>
-      <div class="hint">Resolves stream URL (~2&ndash;5 s) &mdash; nothing downloaded.</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Volume</div>
-      <div class="vol-row">
-        <input type="range" id="vol-range" min="0" max="100" value="100"
-               oninput="onVolume(this.value)">
-        <span id="vol-pct">100%</span>
-      </div>
-    </div>
-
-    <div class="btns">
-      <button class="btn btn-green" onclick="play()">&#9654; Play</button>
-      <button class="btn btn-red"   onclick="doStop()">&#9646;&#9646; Stop</button>
-    </div>
-    <div class="msg" id="msg-host"></div>
+    <div id="dev-list"><span style="color:#999">Loading&hellip;</span></div>
   </div>
 
-  <!-- ══ Room tab ══ -->
-  <div class="tab-panel" id="tab-room">
-    <h2>Room</h2>
+  <div class="card">
+    <div class="ct">Song <small style="font-size:11px;color:#bbb;font-weight:400;text-transform:none;letter-spacing:0">MP3 &middot; WAV &middot; FLAC &middot; OGG</small></div>
+    <div class="frow">
+      <input type="file" id="h-file" accept=".mp3,.wav,.flac,.ogg">
+      <button class="btn bb" onclick="hUpload()">Upload</button>
+      <span id="h-song" style="font-size:13px;color:#16a34a"></span>
+    </div>
+  </div>
 
-    <!-- Step 1: load a song (same as host tab) -->
+  <div class="card">
+    <div class="ct">Or stream from YouTube</div>
+    <div class="frow">
+      <input class="txtin" type="text" id="h-yt" placeholder="https://www.youtube.com/watch?v=...">
+      <button class="btn br" id="h-yt-btn" onclick="hLoadYT()">Load</button>
+    </div>
+    <div class="hint">Resolves stream URL (~2&ndash;5 s) &mdash; nothing downloaded.</div>
+  </div>
+
+  <div class="card">
+    <div class="ct">Volume</div>
+    <div class="vrow">
+      <input type="range" id="vol-range" min="0" max="100" value="100" oninput="onVol(this.value)">
+      <span id="vol-pct">100%</span>
+    </div>
+  </div>
+
+  <div class="btns">
+    <button class="btn bgr" onclick="hPlay()">&#9654; Play</button>
+    <button class="btn br" onclick="hStop()">&#9646;&#9646; Stop</button>
+  </div>
+  <div class="msg" id="msg-host"></div>
+</div>
+
+
+<!-- ═══ Room ═══ -->
+<div class="panel" id="panel-room">
+  <h2>Room</h2>
+
+  <!-- Create room -->
+  <div class="card" id="r-setup">
+    <div class="ct">Start a room</div>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
+      Create a room &mdash; anyone on the same WiFi can join, queue songs, and listen
+      through their own Bluetooth speaker.
+    </p>
+    <button class="btn bsl" onclick="createRoom()">&#43; Create Room</button>
+  </div>
+
+  <!-- Room dashboard (hidden until created) -->
+  <div id="r-dash" style="display:none">
+
+    <!-- Code + share -->
     <div class="card">
-      <div class="card-title">1 &mdash; Load a song</div>
-      <div class="file-row" style="margin-bottom:8px">
-        <input type="file" id="r-file-in" accept=".mp3,.wav,.flac,.ogg">
-        <button class="btn btn-blue" onclick="rUploadFile()">Upload</button>
-        <span id="r-song-tag" style="font-size:13px;color:#16a34a"></span>
+      <div class="ct">Room Code</div>
+      <div class="rcode" id="r-code">????</div>
+      <div class="slink" id="r-link"></div>
+      <div style="margin-top:10px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <span>Listeners: <span class="badge" id="r-members">0</span></span>
+        <span><span class="status-dot" id="r-dot"></span><span id="r-status">Stopped</span></span>
       </div>
-      <hr class="section-sep">
-      <div class="card-title" style="margin-bottom:8px">Or YouTube</div>
-      <div class="file-row">
-        <input class="text-in" type="text" id="r-yt-url"
-               placeholder="https://www.youtube.com/watch?v=...">
-        <button class="btn btn-red" onclick="rLoadYoutube()" id="r-yt-btn">Load</button>
-      </div>
-      <div class="hint">Same source is used for both Room and Single Host.</div>
     </div>
 
-    <!-- Step 2: create room -->
+    <!-- Now playing + controls -->
     <div class="card">
-      <div class="card-title">2 &mdash; Create a room</div>
-      <div id="room-create-area">
-        <button class="btn btn-slate" onclick="createRoom()">&#43; Create Room</button>
-        <div class="hint" style="margin-top:8px">
-          A 4-letter code is generated. Share the link with anyone on the same network.
-        </div>
-      </div>
-
-      <div id="room-active-area" style="display:none">
-        <div class="room-code-box" id="room-code-display">????</div>
-        <div class="share-link" id="room-share-link"></div>
-        <div style="margin-top:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-          <span>Listeners: <span class="member-badge" id="room-members">0</span></span>
-          <span id="room-status-badge" style="font-size:12px;color:var(--muted)">Stopped</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Step 3: controls -->
-    <div class="card" id="room-controls-card" style="display:none">
-      <div class="card-title">3 &mdash; Controls</div>
+      <div class="ct">Controls</div>
+      <div id="r-now" style="font-size:14px;font-weight:600;color:#1e293b;margin-bottom:12px;min-height:20px">—</div>
       <div class="btns">
-        <button class="btn btn-green" onclick="roomPlay()">&#9654; Start Stream</button>
-        <button class="btn btn-red"   onclick="roomStop()">&#9646;&#9646; Stop</button>
+        <button class="btn bgr" onclick="rPlay()">&#9654; Play</button>
+        <button class="btn bam" onclick="rSkip()">&#9197; Skip</button>
+        <button class="btn br"  onclick="rStop()">&#9646;&#9646; Stop</button>
       </div>
     </div>
 
-    <div class="msg" id="msg-room"></div>
-  </div>
+    <!-- Queue -->
+    <div class="card">
+      <div class="ct">Queue <span id="r-q-count" style="font-weight:400;text-transform:none;letter-spacing:0">(0 songs)</span></div>
+      <div id="r-q-list"><span style="color:#999;font-size:13px">Queue is empty &mdash; add songs below.</span></div>
+    </div>
+
+    <!-- Add to queue -->
+    <div class="card">
+      <div class="ct">Add to Queue</div>
+      <div class="frow" style="margin-bottom:10px">
+        <input type="file" id="r-file" accept=".mp3,.wav,.flac,.ogg">
+        <button class="btn bb" onclick="rAddFile()">&#43; Add File</button>
+      </div>
+      <hr class="sep">
+      <div class="frow">
+        <input class="txtin" type="text" id="r-yt" placeholder="YouTube URL">
+        <button class="btn br" id="r-yt-btn" onclick="rAddYT()">&#43; Add YouTube</button>
+      </div>
+      <div class="hint">Anyone in the room can add songs from their device too.</div>
+    </div>
+
+  </div><!-- /r-dash -->
+
+  <div class="msg" id="msg-room"></div>
+</div><!-- /panel-room -->
 
 </main>
 
 <script>
 const $ = id => document.getElementById(id);
-let _roomCode = null;
-let _pollTimer = null;
+let _rCode = null, _pollTimer = null;
 
-// ── Tab switching ──────────────────────────────────────────────────────────
 function switchTab(name, el) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  $('tab-' + name).classList.add('active');
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav').forEach(n => n.classList.remove('active'));
+  $('panel-' + name).classList.add('active');
   el.classList.add('active');
 }
-
-// ── Generic helpers ────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 function showMsg(id, html, type) {
-  const el = $(id);
-  el.innerHTML = html; el.className = 'msg ' + type; el.style.display = 'block';
+  const el = $(id); el.innerHTML = html;
+  el.className = 'msg ' + type; el.style.display = 'block';
 }
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-async function apiFetch(url, opts) {
+async function api(url, opts) {
   try {
     const r = await fetch(url, opts || {});
     const ct = r.headers.get('content-type') || '';
     if (ct.includes('application/json')) return { ok: r.ok, data: await r.json() };
-    return { ok: false, data: { error: `Server error ${r.status} — check terminal.` } };
-  } catch(e) {
-    return { ok: false, data: { error: 'Network error: ' + e } };
-  }
+    return { ok: false, data: { error: `Server error ${r.status}` } };
+  } catch(e) { return { ok: false, data: { error: 'Network error: ' + e } }; }
 }
 
-// ── Single Host ────────────────────────────────────────────────────────────
+/* ── Single Host ── */
 async function loadDevices() {
-  $('device-list').innerHTML = '<span style="color:#999">Loading&hellip;</span>';
-  const { ok, data } = await apiFetch('/api/devices');
-  const box = $('device-list');
+  $('dev-list').innerHTML = '<span style="color:#999">Loading&hellip;</span>';
+  const { ok, data } = await api('/api/devices');
+  const box = $('dev-list');
   if (!ok || !Array.isArray(data) || !data.length) {
-    box.innerHTML = '<span style="color:#999">No WASAPI devices found. Pair speakers then Refresh.</span>';
-    return;
+    box.innerHTML = '<span style="color:#999">No WASAPI devices found. Connect speakers then Refresh.</span>'; return;
   }
   box.innerHTML = '';
   data.forEach(d => {
-    const row = document.createElement('div');
-    row.className = 'device-row';
+    const row = document.createElement('div'); row.className = 'drow';
     row.innerHTML =
       `<input type="checkbox" id="cb${d.id}" value="${d.id}">` +
-      `<label class="device-label" for="cb${d.id}">${escHtml(d.name)}` +
-        `<span class="dev-sr">${d.sample_rate} Hz</span></label>` +
-      `<div class="delay-wrap"><span>Delay</span>` +
-        `<input class="delay-in" type="number" id="dl${d.id}" value="0" min="0" max="10000">` +
-        `<span>ms</span></div>`;
+      `<label class="dlbl" for="cb${d.id}">${esc(d.name)}<span class="dsr">${d.sample_rate} Hz</span></label>` +
+      `<div class="dly"><span>Delay</span><input type="number" id="dl${d.id}" value="0" min="0" max="10000"><span>ms</span></div>`;
     box.appendChild(row);
   });
 }
-async function uploadFile() {
-  const inp = $('file-in');
+async function hUpload() {
+  const inp = $('h-file');
   if (!inp.files.length) { showMsg('msg-host','Choose a file first.','err'); return; }
   const fd = new FormData(); fd.append('file', inp.files[0]);
   showMsg('msg-host','Uploading&hellip;','ok');
-  const { ok, data } = await apiFetch('/api/upload', { method:'POST', body:fd });
-  if (ok) { $('song-tag').textContent = '&#10003; ' + data.message; showMsg('msg-host', escHtml(data.message),'ok'); }
-  else { $('song-tag').textContent=''; showMsg('msg-host', escHtml(data.error||'Upload failed.'),'err'); }
+  const { ok, data } = await api('/api/upload', { method:'POST', body:fd });
+  if (ok) { $('h-song').textContent = data.message; showMsg('msg-host', esc(data.message), 'ok'); }
+  else { showMsg('msg-host', esc(data.error || 'Upload failed.'), 'err'); }
 }
-async function loadYoutube() {
-  const url = $('yt-url').value.trim();
-  if (!url) { showMsg('msg-host','Paste a YouTube URL first.','err'); return; }
-  $('yt-btn').disabled = true;
-  showMsg('msg-host','Resolving stream&hellip; (~2&ndash;5 s)','ok');
-  const { ok, data } = await apiFetch('/api/youtube', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ url })
+async function hLoadYT() {
+  const url = $('h-yt').value.trim();
+  if (!url) { showMsg('msg-host','Paste a YouTube URL.','err'); return; }
+  $('h-yt-btn').disabled = true;
+  showMsg('msg-host','Resolving&hellip; (~2&ndash;5 s)','ok');
+  const { ok, data } = await api('/api/youtube', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})
   });
-  $('yt-btn').disabled = false;
-  if (ok) { $('song-tag').textContent = data.title || data.message; showMsg('msg-host', escHtml(data.message),'ok'); }
-  else { showMsg('msg-host', escHtml(data.error||'YouTube load failed.'),'err'); }
+  $('h-yt-btn').disabled = false;
+  if (ok) { $('h-song').textContent = data.title || data.message; showMsg('msg-host', esc(data.message), 'ok'); }
+  else showMsg('msg-host', esc(data.error || 'Failed.'), 'err');
 }
-async function play() {
-  const checked = document.querySelectorAll('#device-list input[type=checkbox]:checked');
+async function hPlay() {
+  const checked = document.querySelectorAll('#dev-list input[type=checkbox]:checked');
   if (!checked.length) { showMsg('msg-host','Select at least one speaker.','err'); return; }
   const devices = [...checked].map(c => ({ id:+c.value, delay_ms:+($('dl'+c.value).value)||0 }));
   showMsg('msg-host','Starting&hellip;','ok');
-  const { ok, data } = await apiFetch('/api/play', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ devices })
+  const { ok, data } = await api('/api/play', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({devices})
   });
   if (ok) {
     const w = data.warnings;
-    const extra = w&&w.length ? '<br><small>&#9888; '+w.map(escHtml).join('<br>')+'</small>' : '';
-    showMsg('msg-host', escHtml(data.message)+extra, w&&w.length?'warn':'ok');
-  } else { showMsg('msg-host', escHtml(data.error||'Playback failed.'),'err'); }
+    showMsg('msg-host', esc(data.message) + (w&&w.length ? '<br><small>&#9888; '+w.map(esc).join('<br>')+'</small>' : ''), w&&w.length?'warn':'ok');
+  } else showMsg('msg-host', esc(data.error||'Failed.'), 'err');
 }
-async function doStop() {
-  const { ok, data } = await apiFetch('/api/stop', { method:'POST' });
-  showMsg('msg-host', escHtml(data.message||(ok?'Stopped.':'Error.')), ok?'ok':'err');
+async function hStop() {
+  const { ok, data } = await api('/api/stop', {method:'POST'});
+  showMsg('msg-host', esc(data.message||(ok?'Stopped.':'Error.')), ok?'ok':'err');
 }
 let volTimer;
-function onVolume(v) {
-  $('vol-pct').textContent = v+'%';
+function onVol(v) {
+  $('vol-pct').textContent = v + '%';
   clearTimeout(volTimer);
-  volTimer = setTimeout(() => apiFetch('/api/volume', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ volume:+v })
+  volTimer = setTimeout(() => api('/api/volume', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({volume:+v})
   }), 100);
 }
 
-// ── Room tab ───────────────────────────────────────────────────────────────
-async function rUploadFile() {
-  const inp = $('r-file-in');
+/* ── Room ── */
+async function createRoom() {
+  const { ok, data } = await api('/api/room/create', {method:'POST'});
+  if (!ok) { showMsg('msg-room', esc(data.error||'Failed.'), 'err'); return; }
+  _rCode = data.code;
+  $('r-code').textContent = _rCode;
+  const link = location.protocol+'//'+location.hostname+(location.port?':'+location.port:'')+'/join/'+_rCode;
+  $('r-link').textContent = link;
+  $('r-setup').style.display = 'none';
+  $('r-dash').style.display = 'block';
+  showMsg('msg-room', 'Room created! Share the link above with your listeners.', 'ok');
+  startPoll();
+}
+async function rPlay() {
+  if (!_rCode) return;
+  showMsg('msg-room','Starting stream&hellip;','ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/play', {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+}
+async function rSkip() {
+  if (!_rCode) return;
+  const { ok, data } = await api('/api/room/'+_rCode+'/skip', {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+}
+async function rStop() {
+  if (!_rCode) return;
+  const { ok, data } = await api('/api/room/'+_rCode+'/stop', {method:'POST'});
+  showMsg('msg-room', esc(data.message||(ok?'Stopped.':'Error.')), ok?'ok':'err');
+}
+async function rAddFile() {
+  if (!_rCode) return;
+  const inp = $('r-file');
   if (!inp.files.length) { showMsg('msg-room','Choose a file first.','err'); return; }
   const fd = new FormData(); fd.append('file', inp.files[0]);
-  showMsg('msg-room','Uploading&hellip;','ok');
-  const { ok, data } = await apiFetch('/api/upload', { method:'POST', body:fd });
-  if (ok) { $('r-song-tag').textContent = data.message; showMsg('msg-room', escHtml(data.message),'ok'); }
-  else { showMsg('msg-room', escHtml(data.error||'Upload failed.'),'err'); }
+  showMsg('msg-room','Adding to queue&hellip;','ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/queue/add', {method:'POST', body:fd});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+  if (ok) { inp.value = ''; pollState(); }
 }
-async function rLoadYoutube() {
-  const url = $('r-yt-url').value.trim();
-  if (!url) { showMsg('msg-room','Paste a YouTube URL first.','err'); return; }
+async function rAddYT() {
+  if (!_rCode) return;
+  const url = $('r-yt').value.trim();
+  if (!url) { showMsg('msg-room','Paste a YouTube URL.','err'); return; }
   $('r-yt-btn').disabled = true;
-  showMsg('msg-room','Resolving stream&hellip;','ok');
-  const { ok, data } = await apiFetch('/api/youtube', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ url })
+  showMsg('msg-room','Resolving YouTube&hellip; (~2&ndash;5 s)','ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/queue/add', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})
   });
   $('r-yt-btn').disabled = false;
-  if (ok) { $('r-song-tag').textContent = data.title || data.message; showMsg('msg-room', escHtml(data.message),'ok'); }
-  else { showMsg('msg-room', escHtml(data.error||'Failed.'),'err'); }
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+  if (ok) { $('r-yt').value = ''; pollState(); }
 }
-async function createRoom() {
-  const { ok, data } = await apiFetch('/api/room/create', { method:'POST' });
-  if (!ok) { showMsg('msg-room', escHtml(data.error||'Failed.'),'err'); return; }
-  _roomCode = data.code;
-  $('room-code-display').textContent = _roomCode;
-  const link = location.protocol + '//' + location.hostname + ':' + location.port + '/join/' + _roomCode;
-  $('room-share-link').textContent = link;
-  $('room-create-area').style.display = 'none';
-  $('room-active-area').style.display = 'block';
-  $('room-controls-card').style.display = 'block';
-  showMsg('msg-room', 'Room created! Share the link above with your listeners.', 'ok');
-  startPolling();
+async function rRemove(id) {
+  if (!_rCode) return;
+  const { ok, data } = await api('/api/room/'+_rCode+'/queue/remove/'+id, {method:'POST'});
+  if (ok) pollState();
+  else showMsg('msg-room', esc(data.error||'Failed.'), 'err');
 }
-async function roomPlay() {
-  if (!_roomCode) return;
-  showMsg('msg-room','Starting room stream&hellip;','ok');
-  const { ok, data } = await apiFetch('/api/room/'+_roomCode+'/play', { method:'POST' });
-  showMsg('msg-room', escHtml(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+
+function renderQueue(q, currentIdx, playing) {
+  const box = $('r-q-list');
+  $('r-q-count').textContent = '(' + q.length + ' song' + (q.length===1?'':'s') + ')';
+  if (!q.length) {
+    box.innerHTML = '<span style="color:#999;font-size:13px">Queue is empty &mdash; add songs below.</span>'; return;
+  }
+  box.innerHTML = '';
+  q.forEach((it, i) => {
+    const isCurrent = (i === currentIdx);
+    const div = document.createElement('div');
+    div.className = 'qi' + (isCurrent ? ' current' : '');
+    div.innerHTML =
+      `<span class="qi-num">${i+1}</span>` +
+      `<span class="qi-title">${esc(it.title)}<span class="qi-by">${esc(it.added_by)}</span>` +
+        (isCurrent && playing ? '<span class="qi-now">&#9654; now playing</span>' : isCurrent ? '<span class="qi-now">&#8212; next</span>' : '') +
+      `</span>` +
+      (!isCurrent || !playing ? `<button class="qi-rm" onclick="rRemove('${it.id}')" title="Remove">&#215;</button>` : '');
+    box.appendChild(div);
+  });
 }
-async function roomStop() {
-  if (!_roomCode) return;
-  const { ok, data } = await apiFetch('/api/room/'+_roomCode+'/stop', { method:'POST' });
-  showMsg('msg-room', escHtml(data.message||(ok?'Stopped.':'Error.')), ok?'ok':'err');
+
+async function pollState() {
+  if (!_rCode) return;
+  const { ok, data } = await api('/api/room/'+_rCode+'/state');
+  if (!ok) return;
+  $('r-members').textContent = data.member_count || 0;
+  const dot = $('r-dot'), st = $('r-status');
+  dot.className = 'status-dot' + (data.playing ? ' live' : '');
+  st.textContent = data.playing ? ('Playing: ' + (data.current_title||'')) : 'Stopped';
+  $('r-now').textContent = data.current_title || '—';
+  renderQueue(data.queue, data.current_idx, data.playing);
 }
-function startPolling() {
+function startPoll() {
   clearInterval(_pollTimer);
-  _pollTimer = setInterval(async () => {
-    if (!_roomCode) return;
-    const { ok, data } = await apiFetch('/api/room/'+_roomCode+'/state');
-    if (!ok) return;
-    $('room-members').textContent = data.member_count || 0;
-    $('room-status-badge').textContent = data.playing
-      ? ('Playing: ' + (data.title||'')) : 'Stopped';
-    $('room-status-badge').style.color = data.playing ? '#16a34a' : '#6b7280';
-  }, 2000);
+  _pollTimer = setInterval(pollState, 2000);
+  pollState();
 }
 
 loadDevices();
@@ -1020,83 +1118,184 @@ loadDevices();
 </html>"""
 
 
-JOIN_HTML = """<!DOCTYPE html>
+JOIN_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Room {{ code }}</title>
 <style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: Arial,Helvetica,sans-serif; background: #0f172a; color: #f1f5f9;
-       display: flex; align-items: center; justify-content: center;
-       min-height: 100vh; padding: 24px; }
-.card { background: #1e293b; border-radius: 16px; padding: 36px 32px;
-        max-width: 420px; width: 100%; text-align: center; }
-.badge { font-size: 48px; font-weight: 900; letter-spacing: .15em;
-         color: #60a5fa; margin-bottom: 6px; }
-.label { font-size: 13px; color: #94a3b8; margin-bottom: 24px; }
-.now-playing { font-size: 15px; color: #f8fafc; margin-bottom: 20px;
-               min-height: 22px; font-weight: 600; }
-audio { width: 100%; border-radius: 8px; margin-bottom: 20px; }
-.status { font-size: 12px; color: #64748b; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-       background: #ef4444; margin-right: 6px; }
-.dot.live { background: #22c55e; animation: pulse 1.2s ease infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,Helvetica,sans-serif;background:#0f172a;color:#f1f5f9;
+     min-height:100vh;padding:24px 16px;display:flex;justify-content:center}
+.wrap{max-width:460px;width:100%}
+.room-badge{font-size:13px;color:#64748b;margin-bottom:4px;letter-spacing:.05em;text-transform:uppercase}
+h1{font-size:28px;font-weight:900;letter-spacing:.15em;color:#60a5fa;margin-bottom:20px}
+.card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:14px;border:1px solid #334155}
+.ct{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin-bottom:12px}
+.now{font-size:15px;font-weight:600;color:#f8fafc;margin-bottom:4px;min-height:22px}
+.added{font-size:12px;color:#64748b;margin-bottom:14px}
+audio{width:100%;border-radius:8px;margin-bottom:10px}
+.status{display:flex;align-items:center;gap:8px;font-size:12px;color:#64748b}
+.dot{width:8px;height:8px;border-radius:50%;background:#ef4444;flex-shrink:0}
+.dot.live{background:#22c55e;animation:pulse 1.2s ease infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.frow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.txtin{flex:1;min-width:0;padding:7px 10px;border:1px solid #334155;border-radius:5px;
+       font-size:13px;background:#0f172a;color:#f1f5f9}
+.txtin::placeholder{color:#475569}
+.btn{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.bb{background:#2563eb;color:#fff}
+.br{background:#dc2626;color:#fff}
+.btn:hover{filter:brightness(90%)}
+.msg{padding:8px 12px;border-radius:6px;font-size:12px;margin-top:8px;display:none}
+.msg.ok{background:#14532d;color:#bbf7d0}
+.msg.err{background:#7f1d1d;color:#fecaca}
+
+.qi{padding:7px 10px;border-radius:6px;font-size:13px;margin-bottom:4px;
+    background:#0f172a;border:1px solid #334155;display:flex;gap:8px;align-items:center}
+.qi.current{border-color:#3b82f6;background:#1e3a5f}
+.qi-n{font-size:11px;color:#64748b;width:18px;text-align:right;flex-shrink:0}
+.qi-t{flex:1;font-weight:500}
+.qi-now{font-size:11px;color:#60a5fa;margin-left:6px}
+.hint{font-size:12px;color:#475569;margin-top:6px}
 </style>
 </head>
 <body>
-<div class="card">
-  <div class="badge">{{ code }}</div>
-  <div class="label">Room &mdash; join &amp; listen</div>
-  <div class="now-playing" id="now-playing">Waiting for host&hellip;</div>
-  <audio id="player" controls autoplay></audio>
-  <div class="status">
-    <span class="dot" id="dot"></span>
-    <span id="status-text">Connecting&hellip;</span>
+<div class="wrap">
+  <div class="room-badge">Room</div>
+  <h1>{{ code }}</h1>
+
+  <div class="card">
+    <div class="ct">Now Playing</div>
+    <div class="now" id="now-title">Waiting for host&hellip;</div>
+    <div class="added" id="now-sub"></div>
+    <audio id="player" controls autoplay></audio>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="status-txt">Connecting&hellip;</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="ct">Add to Queue</div>
+    <div class="frow">
+      <input type="file" id="j-file" accept=".mp3,.wav,.flac,.ogg" style="flex:1;min-width:0;color:#94a3b8">
+      <button class="btn bb" onclick="jAddFile()">&#43; Add</button>
+    </div>
+    <hr style="border:none;border-top:1px solid #334155;margin:10px 0">
+    <div class="frow">
+      <input class="txtin" type="text" id="j-yt" placeholder="YouTube URL">
+      <button class="btn br" id="j-yt-btn" onclick="jAddYT()">&#43; Add</button>
+    </div>
+    <div class="hint">Your song will play after the current queue.</div>
+    <div class="msg" id="j-msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="ct">Queue <span id="j-q-count" style="font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+    <div id="j-q-list"><span style="color:#475569;font-size:13px">Empty</span></div>
   </div>
 </div>
-<script>
-const code = "{{ code }}";
-const player = document.getElementById('player');
-const dot = document.getElementById('dot');
-const statusEl = document.getElementById('status-text');
-const nowPlaying = document.getElementById('now-playing');
-let playing = false;
 
-async function poll() {
-  try {
-    const r = await fetch('/api/room/' + code + '/state');
-    if (!r.ok) { statusEl.textContent = 'Room not found.'; return; }
-    const d = await r.json();
-    if (d.playing && !playing) {
-      playing = true;
-      player.src = '/room/' + code + '/stream';
+<script>
+const CODE = "{{ code }}";
+const player = document.getElementById('player');
+let _playing = false, _streamTs = 0;
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function showMsg(html,type){const el=document.getElementById('j-msg');el.innerHTML=html;el.className='msg '+type;el.style.display='block'}
+
+async function api(url,opts){
+  try{
+    const r=await fetch(url,opts||{});
+    const ct=r.headers.get('content-type')||'';
+    if(ct.includes('application/json'))return{ok:r.ok,data:await r.json()};
+    return{ok:false,data:{error:'Server error '+r.status}};
+  }catch(e){return{ok:false,data:{error:'Network error: '+e}};}
+}
+
+async function jAddFile(){
+  const inp=document.getElementById('j-file');
+  if(!inp.files.length){showMsg('Choose a file first.','err');return;}
+  const fd=new FormData();fd.append('file',inp.files[0]);
+  showMsg('Adding&hellip;','ok');
+  const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{method:'POST',body:fd});
+  showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
+  if(ok){inp.value='';pollState();}
+}
+async function jAddYT(){
+  const url=document.getElementById('j-yt').value.trim();
+  if(!url){showMsg('Paste a YouTube URL.','err');return;}
+  document.getElementById('j-yt-btn').disabled=true;
+  showMsg('Resolving&hellip; (~2&ndash;5 s)','ok');
+  const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})
+  });
+  document.getElementById('j-yt-btn').disabled=false;
+  showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
+  if(ok){document.getElementById('j-yt').value='';pollState();}
+}
+
+function renderQueue(q,idx,playing){
+  const box=document.getElementById('j-q-list');
+  document.getElementById('j-q-count').textContent='('+q.length+')';
+  if(!q.length){box.innerHTML='<span style="color:#475569;font-size:13px">Empty</span>';return;}
+  box.innerHTML='';
+  q.forEach((it,i)=>{
+    const isCur=(i===idx);
+    const div=document.createElement('div');div.className='qi'+(isCur?' current':'');
+    div.innerHTML=`<span class="qi-n">${i+1}</span><span class="qi-t">${esc(it.title)}`+
+      (isCur&&playing?'<span class="qi-now">&#9654; now</span>':'')+`</span>`;
+    box.appendChild(div);
+  });
+}
+
+async function pollState(){
+  const{ok,data}=await api('/api/room/'+CODE+'/state');
+  if(!ok){document.getElementById('status-txt').textContent='Room not found.';return;}
+  const dot=document.getElementById('dot');
+  const st=document.getElementById('status-txt');
+  const nowTitle=document.getElementById('now-title');
+
+  renderQueue(data.queue,data.current_idx,data.playing);
+
+  if(data.playing&&!_playing){
+    _playing=true;_streamTs=Date.now();
+    player.src='/room/'+CODE+'/stream?t='+_streamTs;
+    player.play().catch(()=>{});
+    dot.className='dot live';st.textContent='Live';
+    nowTitle.textContent=data.current_title||'Now playing';
+  } else if(!data.playing&&_playing){
+    _playing=false;player.src='';
+    dot.className='dot';st.textContent='Waiting for host&hellip;';
+    nowTitle.textContent='Waiting for host…';
+  } else if(data.playing){
+    nowTitle.textContent=data.current_title||'Now playing';
+    st.textContent='Live';
+    // reconnect if audio stalled
+    if(player.paused&&!player.ended){
       player.play().catch(()=>{});
-      dot.className = 'dot live';
-      statusEl.textContent = 'Live';
-      nowPlaying.textContent = d.title || 'Now playing';
-    } else if (!d.playing && playing) {
-      playing = false;
-      player.src = '';
-      dot.className = 'dot';
-      statusEl.textContent = 'Stopped';
-      nowPlaying.textContent = 'Waiting for host…';
     }
-    if (!d.playing) statusEl.textContent = 'Waiting…';
-  } catch(e) {
-    statusEl.textContent = 'Error connecting.';
   }
 }
-poll();
-setInterval(poll, 2000);
+
+player.addEventListener('ended',()=>{
+  _playing=false;
+  document.getElementById('dot').className='dot';
+  document.getElementById('status-txt').textContent='Waiting for next song&hellip;';
+});
+
+pollState();
+setInterval(pollState,2000);
 </script>
 </body>
 </html>"""
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print()
