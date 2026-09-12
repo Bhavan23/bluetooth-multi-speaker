@@ -380,6 +380,11 @@ def handle_exception(e):
 
 # ── Main page ──────────────────────────────────────────────────────────────────
 
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -861,14 +866,25 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
 <div class="panel" id="panel-room">
   <h2>Room</h2>
 
-  <!-- Create room -->
+  <!-- Create or join room -->
   <div class="card" id="r-setup">
-    <div class="ct">Start a room</div>
+    <div class="ct">Create a room</div>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
-      Create a room &mdash; anyone on the same WiFi can join, queue songs, and listen
+      Start a room &mdash; anyone on the same WiFi can join, queue songs, and listen
       through their own Bluetooth speaker.
     </p>
     <button class="btn bsl" onclick="createRoom()">&#43; Create Room</button>
+
+    <hr class="sep" style="margin:16px 0">
+
+    <div class="ct">Join a room</div>
+    <div class="frow">
+      <input class="txtin" type="text" id="join-code" maxlength="4"
+             placeholder="Enter 4-letter code (e.g. JAZZ)"
+             oninput="this.value=this.value.toUpperCase()"
+             onkeydown="if(event.key==='Enter')joinRoom()">
+      <button class="btn bb" onclick="joinRoom()">Join &rarr;</button>
+    </div>
   </div>
 
   <!-- Room dashboard (hidden until created) -->
@@ -1016,6 +1032,11 @@ function onVol(v) {
 }
 
 /* ── Room ── */
+function joinRoom() {
+  const code = ($('join-code').value || '').trim().toUpperCase();
+  if (code.length !== 4) { showMsg('msg-room', 'Enter the 4-letter room code.', 'err'); return; }
+  window.location.href = '/join/' + code;
+}
 async function createRoom() {
   const { ok, data } = await api('/api/room/create', {method:'POST'});
   if (!ok) { showMsg('msg-room', esc(data.error||'Failed.'), 'err'); return; }
