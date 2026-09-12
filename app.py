@@ -650,6 +650,37 @@ def api_room_play(code):
     return jsonify({"message": f'Playing: {title}'})
 
 
+@app.route("/api/room/<code>/jump/<item_id>", methods=["POST"])
+def api_room_jump(code, item_id):
+    """Host forces everyone onto a specific song immediately."""
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    idx = next((i for i, it in enumerate(room["queue"]) if it["id"] == item_id), None)
+    if idx is None:
+        return jsonify({"error": "Song not found in playlist"}), 404
+    _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    room["playing"] = True
+    _room_start_item(code, idx)
+    return jsonify({"message": f'Now playing for everyone: {room["queue"][idx]["title"]}'})
+
+
+@app.route("/api/room/<code>/sync", methods=["POST"])
+def api_room_sync(code):
+    """Restart current song so all members reconnect in sync."""
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    room = _rooms[code]
+    if not room["queue"]:
+        return jsonify({"error": "Playlist is empty"}), 400
+    _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    room["playing"] = True
+    _room_start_item(code, room["current_idx"])
+    return jsonify({"message": "Synced — all members restarting current song."})
+
+
 @app.route("/api/room/<code>/skip", methods=["POST"])
 def api_room_skip(code):
     if code not in _rooms:
@@ -940,6 +971,7 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
         <button class="btn bgr" onclick="rPlay()">&#9654; Play</button>
         <button class="btn bam" onclick="rSkip()">&#9197; Skip</button>
         <button class="btn br"  onclick="rStopRoom()">&#9646;&#9646; Stop Room</button>
+        <button class="btn" style="background:#0891b2;color:#fff" onclick="rSync()" title="Restart current song for all members">&#8635; Sync All</button>
       </div>
       <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
         <button class="btn" id="r-meeting-btn" onclick="rToggleMeeting()"
@@ -1101,6 +1133,18 @@ async function rSkip() {
   const { ok, data } = await api('/api/room/'+_rCode+'/skip', {method:'POST'});
   showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
 }
+async function rSync() {
+  if (!_rCode) return;
+  showMsg('msg-room', 'Syncing all members&hellip;', 'ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/sync', {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+}
+async function rJump(itemId) {
+  if (!_rCode) return;
+  showMsg('msg-room', 'Switching song for everyone&hellip;', 'ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/jump/'+itemId, {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+}
 async function rStopRoom() {
   if (!_rCode) return;
   const { ok, data } = await api('/api/room/'+_rCode+'/stop', {method:'POST'});
@@ -1178,6 +1222,7 @@ function renderQueue(q, currentIdx, playing) {
       `<span class="qi-title">${esc(it.title)}</span>` +
       `<span class="qi-by-badge">${esc(it.added_by)}</span>` +
       (isCurrent && playing ? '<span class="qi-now">&#9654; now</span>' : isCurrent ? '<span class="qi-now">next</span>' : '') +
+      (!isCurrent ? `<button class="btn" style="background:#059669;color:#fff;padding:3px 8px;font-size:11px;flex-shrink:0" onclick="rJump('${it.id}')" title="Play this for everyone">&#9654; All</button>` : '') +
       (!isPast ? `<button class="qi-rm" onclick="rRemove('${it.id}')" title="Remove">&#215;</button>` : '');
     box.appendChild(div);
   });
