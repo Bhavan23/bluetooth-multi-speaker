@@ -556,7 +556,7 @@ def api_room_state(code):
         "current_title": current_title,
         "member_count": mc,
         "queue": [{"id": it["id"], "title": it["title"],
-                   "added_by": it["added_by"]} for it in q],
+                   "source": it["source"], "added_by": it["added_by"]} for it in q],
     })
 
 
@@ -565,7 +565,7 @@ def api_room_queue_add(code):
     if code not in _rooms:
         return jsonify({"error": "Room not found"}), 404
 
-    added_by = "Host" if request.remote_addr in ("127.0.0.1", "::1") else request.remote_addr
+    is_host = request.remote_addr in ("127.0.0.1", "::1")
 
     # File upload
     if "file" in request.files:
@@ -575,6 +575,7 @@ def api_room_queue_add(code):
         ext = os.path.splitext(f.filename)[1].lower()
         if ext not in (".mp3", ".wav", ".flac", ".ogg"):
             return jsonify({"error": f'Format "{ext}" not supported.'}), 400
+        added_by = "Host" if is_host else (request.form.get("name") or "").strip() or request.remote_addr
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         f.save(tmp.name); tmp.close()
         item = {"id": _new_id(), "title": f.filename,
@@ -590,6 +591,7 @@ def api_room_queue_add(code):
         return jsonify({"error": "Provide a file or YouTube URL."}), 400
     if "youtube.com" not in url and "youtu.be" not in url:
         return jsonify({"error": "Not a valid YouTube URL."}), 400
+    added_by = "Host" if is_host else (body.get("name") or "").strip() or request.remote_addr
     try:
         import yt_dlp
         with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True,
@@ -813,7 +815,11 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
 .qi-title{flex:1;font-size:13px;font-weight:500}
 .qi-by{font-size:11px;color:#9ca3af;margin-left:4px}
 .qi-now{font-size:11px;font-weight:700;color:var(--accent);margin-left:4px}
-.qi-rm{background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px;padding:0 4px;line-height:1}
+.qi-by-badge{font-size:11px;background:#e0e7ff;color:#3730a3;border-radius:999px;
+             padding:2px 8px;white-space:nowrap;flex-shrink:0}
+.qi.current .qi-by-badge{background:#bfdbfe;color:#1e40af}
+.qi.past{opacity:.45}
+.qi-rm{background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px;padding:0 4px;line-height:1;flex-shrink:0}
 .qi-rm:hover{color:#b91c1c}
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:6px}
 .status-dot.live{background:#22c55e;animation:pulse 1.2s ease infinite}
@@ -944,15 +950,18 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
       </div>
     </div>
 
-    <!-- Queue -->
+    <!-- Playlist / Queue -->
     <div class="card">
-      <div class="ct">Queue <span id="r-q-count" style="font-weight:400;text-transform:none;letter-spacing:0">(0 songs)</span></div>
-      <div id="r-q-list"><span style="color:#999;font-size:13px">Queue is empty &mdash; add songs below.</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <span class="ct" style="margin-bottom:0">Playlist</span>
+        <span id="r-q-count" style="font-size:12px;color:var(--muted)">0 songs</span>
+      </div>
+      <div id="r-q-list"><span style="color:#999;font-size:13px">Playlist is empty &mdash; add songs below.</span></div>
     </div>
 
     <!-- Add to queue -->
     <div class="card">
-      <div class="ct">Add to Queue</div>
+      <div class="ct">Add to Playlist</div>
       <div class="frow" style="margin-bottom:10px">
         <input type="file" id="r-file" accept=".mp3,.wav,.flac,.ogg">
         <button class="btn bb" onclick="rAddFile()">&#43; Add File</button>
@@ -1147,23 +1156,29 @@ async function rRemove(id) {
   else showMsg('msg-room', esc(data.error||'Failed.'), 'err');
 }
 
+function srcIcon(src) {
+  return src === 'youtube' ? '<span title="YouTube" style="color:#dc2626;font-size:12px">&#9654; YT</span>'
+                           : '<span title="File" style="color:#6b7280;font-size:12px">&#127925; File</span>';
+}
 function renderQueue(q, currentIdx, playing) {
   const box = $('r-q-list');
-  $('r-q-count').textContent = '(' + q.length + ' song' + (q.length===1?'':'s') + ')';
+  $('r-q-count').textContent = q.length + ' song' + (q.length===1?'':'s');
   if (!q.length) {
-    box.innerHTML = '<span style="color:#999;font-size:13px">Queue is empty &mdash; add songs below.</span>'; return;
+    box.innerHTML = '<span style="color:#999;font-size:13px">Playlist is empty &mdash; add songs below.</span>'; return;
   }
   box.innerHTML = '';
   q.forEach((it, i) => {
     const isCurrent = (i === currentIdx);
+    const isPast    = (i < currentIdx);
     const div = document.createElement('div');
-    div.className = 'qi' + (isCurrent ? ' current' : '');
+    div.className = 'qi' + (isCurrent ? ' current' : '') + (isPast ? ' past' : '');
     div.innerHTML =
       `<span class="qi-num">${i+1}</span>` +
-      `<span class="qi-title">${esc(it.title)}<span class="qi-by">${esc(it.added_by)}</span>` +
-        (isCurrent && playing ? '<span class="qi-now">&#9654; now playing</span>' : isCurrent ? '<span class="qi-now">&#8212; next</span>' : '') +
-      `</span>` +
-      (!isCurrent || !playing ? `<button class="qi-rm" onclick="rRemove('${it.id}')" title="Remove">&#215;</button>` : '');
+      `<span style="margin-right:6px">${srcIcon(it.source)}</span>` +
+      `<span class="qi-title">${esc(it.title)}</span>` +
+      `<span class="qi-by-badge">${esc(it.added_by)}</span>` +
+      (isCurrent && playing ? '<span class="qi-now">&#9654; now</span>' : isCurrent ? '<span class="qi-now">next</span>' : '') +
+      (!isPast ? `<button class="qi-rm" onclick="rRemove('${it.id}')" title="Remove">&#215;</button>` : '');
     box.appendChild(div);
   });
 }
@@ -1255,7 +1270,14 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
   </div>
 
   <div class="card">
-    <div class="ct">Add to Queue</div>
+    <div class="ct">Your Name</div>
+    <input class="txtin" type="text" id="j-name" placeholder="Enter your name (shown on playlist)"
+           oninput="saveName()" style="width:100%">
+    <div class="hint">Shows next to songs you add.</div>
+  </div>
+
+  <div class="card">
+    <div class="ct">Add to Playlist</div>
     <div class="frow">
       <input type="file" id="j-file" accept=".mp3,.wav,.flac,.ogg" style="flex:1;min-width:0;color:#94a3b8">
       <button class="btn bb" onclick="jAddFile()">&#43; Add</button>
@@ -1265,12 +1287,15 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
       <input class="txtin" type="text" id="j-yt" placeholder="YouTube URL">
       <button class="btn br" id="j-yt-btn" onclick="jAddYT()">&#43; Add</button>
     </div>
-    <div class="hint">Your song will play after the current queue.</div>
+    <div class="hint">Your song plays after the current queue.</div>
     <div class="msg" id="j-msg"></div>
   </div>
 
   <div class="card">
-    <div class="ct">Queue <span id="j-q-count" style="font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <span class="ct" style="margin-bottom:0">Playlist</span>
+      <span id="j-q-count" style="font-size:12px;color:#64748b"></span>
+    </div>
     <div id="j-q-list"><span style="color:#475569;font-size:13px">Empty</span></div>
   </div>
 </div>
@@ -1282,6 +1307,8 @@ let _playing = false, _streamTs = 0;
 
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function showMsg(html,type){const el=document.getElementById('j-msg');el.innerHTML=html;el.className='msg '+type;el.style.display='block'}
+function myName(){return (document.getElementById('j-name').value||'').trim()||'Guest'}
+function saveName(){try{localStorage.setItem('room_name',document.getElementById('j-name').value);}catch(e){}}
 
 async function api(url,opts){
   try{
@@ -1295,7 +1322,7 @@ async function api(url,opts){
 async function jAddFile(){
   const inp=document.getElementById('j-file');
   if(!inp.files.length){showMsg('Choose a file first.','err');return;}
-  const fd=new FormData();fd.append('file',inp.files[0]);
+  const fd=new FormData();fd.append('file',inp.files[0]);fd.append('name',myName());
   showMsg('Adding&hellip;','ok');
   const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{method:'POST',body:fd});
   showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
@@ -1307,23 +1334,34 @@ async function jAddYT(){
   document.getElementById('j-yt-btn').disabled=true;
   showMsg('Resolving&hellip; (~2&ndash;5 s)','ok');
   const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{
-    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url,name:myName()})
   });
   document.getElementById('j-yt-btn').disabled=false;
   showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
   if(ok){document.getElementById('j-yt').value='';pollState();}
 }
 
+function jSrcIcon(src){
+  return src==='youtube'
+    ? '<span style="color:#ef4444;font-size:11px;margin-right:4px">&#9654; YT</span>'
+    : '<span style="color:#6b7280;font-size:11px;margin-right:4px">&#127925;</span>';
+}
 function renderQueue(q,idx,playing){
   const box=document.getElementById('j-q-list');
-  document.getElementById('j-q-count').textContent='('+q.length+')';
+  document.getElementById('j-q-count').textContent=q.length+' song'+(q.length===1?'':'s');
   if(!q.length){box.innerHTML='<span style="color:#475569;font-size:13px">Empty</span>';return;}
   box.innerHTML='';
   q.forEach((it,i)=>{
-    const isCur=(i===idx);
-    const div=document.createElement('div');div.className='qi'+(isCur?' current':'');
-    div.innerHTML=`<span class="qi-n">${i+1}</span><span class="qi-t">${esc(it.title)}`+
-      (isCur&&playing?'<span class="qi-now">&#9654; now</span>':'')+`</span>`;
+    const isCur=(i===idx);const isPast=(i<idx);
+    const div=document.createElement('div');
+    div.className='qi'+(isCur?' current':'')+(isPast?' past':'');
+    div.innerHTML=
+      `<span class="qi-n">${i+1}</span>`+
+      jSrcIcon(it.source)+
+      `<span class="qi-t">${esc(it.title)}</span>`+
+      `<span style="font-size:11px;background:#1e3a5f;color:#93c5fd;border-radius:999px;padding:2px 8px;white-space:nowrap;flex-shrink:0">${esc(it.added_by)}</span>`+
+      (isCur&&playing?'<span class="qi-now" style="margin-left:6px">&#9654; now</span>':'');
     box.appendChild(div);
   });
 }
@@ -1368,6 +1406,7 @@ player.addEventListener('ended',()=>{
   document.getElementById('status-txt').textContent='Waiting for next song&hellip;';
 });
 
+try{const n=localStorage.getItem('room_name');if(n)document.getElementById('j-name').value=n;}catch(e){}
 pollState();
 setInterval(pollState,2000);
 </script>
