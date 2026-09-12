@@ -528,9 +528,15 @@ def api_volume():
 
 @app.route("/api/room/create", methods=["POST"])
 def api_room_create():
-    code = _gen_code()
+    body = request.get_json(silent=True) or {}
+    requested = (body.get("code") or "").strip().upper()
+    if requested and len(requested) == 4 and requested.isalpha():
+        code = requested
+    else:
+        code = _gen_code()
     with _room_lock:
-        while code in _rooms: code = _gen_code()
+        if code in _rooms:
+            return jsonify({"error": f'Room "{code}" already exists. Choose a different code.'}), 400
         _rooms[code] = {"code": code, "playing": False,
                         "current_idx": 0, "queue": [], "created_at": time.time()}
         _room_clients[code] = []
@@ -932,18 +938,24 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
   <div class="card" id="r-setup">
     <div class="ct">Create a room</div>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
-      Start a room &mdash; anyone on the same WiFi can join, queue songs, and listen
-      through their own Bluetooth speaker.
+      Pick a 4-letter room code. Anyone on the same WiFi joins with this code.
     </p>
-    <button class="btn bsl" onclick="createRoom()">&#43; Create Room</button>
+    <div class="frow" style="margin-bottom:6px">
+      <input class="txtin" type="text" id="create-code" maxlength="4" value="PLAY"
+             style="font-size:20px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;max-width:140px;text-align:center"
+             oninput="this.value=this.value.toUpperCase().replace(/[^A-Z]/g,'')"
+             onkeydown="if(event.key==='Enter')createRoom()">
+      <button class="btn bsl" onclick="createRoom()">&#43; Create Room</button>
+    </div>
+    <div class="hint">Default is PLAY &mdash; change it to anything you like (4 letters).</div>
 
     <hr class="sep" style="margin:16px 0">
 
     <div class="ct">Join a room</div>
     <div class="frow">
       <input class="txtin" type="text" id="join-code" maxlength="4"
-             placeholder="Enter 4-letter code (e.g. JAZZ)"
-             oninput="this.value=this.value.toUpperCase()"
+             placeholder="Enter 4-letter code (e.g. PLAY)"
+             oninput="this.value=this.value.toUpperCase().replace(/[^A-Z]/g,'')"
              onkeydown="if(event.key==='Enter')joinRoom()">
       <button class="btn bb" onclick="joinRoom()">Join &rarr;</button>
     </div>
@@ -1111,7 +1123,12 @@ function joinRoom() {
   window.location.href = '/join/' + code;
 }
 async function createRoom() {
-  const { ok, data } = await api('/api/room/create', {method:'POST'});
+  const code = ($('create-code').value || '').trim().toUpperCase();
+  if (code.length !== 4) { showMsg('msg-room', 'Room code must be exactly 4 letters.', 'err'); return; }
+  const { ok, data } = await api('/api/room/create', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ code })
+  });
   if (!ok) { showMsg('msg-room', esc(data.error||'Failed.'), 'err'); return; }
   _rCode = data.code;
   $('r-code').textContent = _rCode;
