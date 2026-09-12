@@ -311,8 +311,32 @@ def _room_start_item(code, idx):
 
     # Build FFmpeg input args
     if item["source"] == "youtube":
+        # Re-resolve URL fresh at play time — YouTube stream URLs expire quickly
+        fresh_url = item["url"]
+        yt_page = item.get("yt_page_url")
+        if yt_page:
+            try:
+                import yt_dlp
+                with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True,
+                                        "no_warnings": True, "noplaylist": True}) as ydl:
+                    info = ydl.extract_info(yt_page, download=False)
+                    resolved = info.get("url")
+                    if not resolved:
+                        fmts = [f for f in info.get("formats", [])
+                                if f.get("url") and f.get("acodec") not in (None, "none")]
+                        if not fmts:
+                            fmts = [f for f in info.get("formats", []) if f.get("url")]
+                        if fmts:
+                            fmts.sort(key=lambda x: x.get("abr") or x.get("tbr") or 0, reverse=True)
+                            resolved = fmts[0]["url"]
+                    if resolved:
+                        fresh_url = resolved
+                        item["url"] = resolved  # update cache
+                print(f"[Room {code}] YouTube URL refreshed for: {item['title']}", flush=True)
+            except Exception as exc:
+                print(f"[Room {code}] URL re-resolve failed, using cached: {exc}", flush=True)
         ffmpeg_in = ["-reconnect", "1", "-reconnect_streamed", "1",
-                     "-reconnect_delay_max", "5", "-i", item["url"]]
+                     "-reconnect_delay_max", "5", "-i", fresh_url]
     else:
         ffmpeg_in = ["-i", item["path"]]
 
@@ -448,6 +472,8 @@ def api_youtube():
         return jsonify({"error": f"Could not load video: {exc}"}), 500
     _is_stream = True; _stream_url = stream_url
     _stream_title = title; _uploaded_path = None
+    # Store original page URL so play_stream can re-resolve if needed
+    app.config["_yt_page_url"] = url
     return jsonify({"message": f"Ready: {title}", "title": title})
 
 
@@ -615,7 +641,9 @@ def api_room_queue_add(code):
     except Exception as exc:
         return jsonify({"error": f"Could not load YouTube: {exc}"}), 500
     item = {"id": _new_id(), "title": title,
-            "source": "youtube", "path": None, "url": stream_url,
+            "source": "youtube", "path": None,
+            "url": stream_url,        # cached stream URL (may expire)
+            "yt_page_url": url,       # original YouTube page URL for re-resolving
             "added_by": added_by}
     _rooms[code]["queue"].append(item)
     return jsonify({"message": f'Added: {title}', "id": item["id"]})
