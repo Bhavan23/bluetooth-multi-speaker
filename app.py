@@ -1344,6 +1344,15 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
 </style>
 </head>
 <body>
+
+<!-- Meeting mode overlay -->
+<div id="meeting-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);
+     z-index:999;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px">
+  <div style="font-size:56px;margin-bottom:16px">&#127908;</div>
+  <div style="font-size:22px;font-weight:800;color:#fbbf24;margin-bottom:8px">Meeting in Progress</div>
+  <div style="font-size:14px;color:#94a3b8">Music paused by the host. It will resume when the meeting ends.</div>
+</div>
+
 <div class="wrap">
   <div class="room-badge">Room</div>
   <h1>{{ code }}</h1>
@@ -1466,11 +1475,15 @@ async function pollState(){
   renderQueue(data.queue,data.current_idx,data.playing);
 
   if(data.paused){
-    if(_playing){_playing=false;player.src='';}
-    dot.className='dot';
-    dot.style.background='#f59e0b';
-    st.textContent='Meeting in progress — music paused';
-    nowTitle.textContent='&#127908; Meeting mode on';
+    if(_playing){
+      _playing=false;
+      player.pause();   // stop immediately, don't wait for buffer to drain
+      player.src='';
+    }
+    showMeetingOverlay(true);
+    dot.className='dot';dot.style.background='#f59e0b';
+    st.textContent='Meeting in progress';
+    nowTitle.textContent='Meeting mode on';
   } else if(data.playing&&!_playing){
     _playing=true;_streamTs=Date.now();
     player.src='/room/'+CODE+'/stream?t='+_streamTs;
@@ -1479,15 +1492,22 @@ async function pollState(){
     st.textContent='Live';
     nowTitle.textContent=data.current_title||'Now playing';
   } else if(!data.playing&&_playing){
-    _playing=false;player.src='';
+    _playing=false;player.pause();player.src='';
+    showMeetingOverlay(false);
     dot.className='dot';dot.style.background='';
     st.textContent='Waiting for host…';
     nowTitle.textContent='Waiting for host…';
   } else if(data.playing){
+    showMeetingOverlay(false);
     nowTitle.textContent=data.current_title||'Now playing';
     dot.style.background='';st.textContent='Live';
     if(player.paused&&!player.ended){player.play().catch(()=>{});}
   }
+}
+
+function showMeetingOverlay(show){
+  const ov=document.getElementById('meeting-overlay');
+  if(ov) ov.style.display = show ? 'flex' : 'none';
 }
 
 player.addEventListener('ended',()=>{
@@ -1498,7 +1518,7 @@ player.addEventListener('ended',()=>{
 
 try{const n=localStorage.getItem('room_name');if(n)document.getElementById('j-name').value=n;}catch(e){}
 pollState();
-setInterval(pollState,2000);
+setInterval(pollState, 1000);
 </script>
 </body>
 </html>"""
