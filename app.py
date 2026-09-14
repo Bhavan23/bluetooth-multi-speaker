@@ -48,6 +48,7 @@ _room_ffmpeg    = {}   # code -> Popen
 _room_readers   = {}   # code -> Thread
 _room_lock      = threading.Lock()
 _room_no_advance = set()   # codes where auto-advance is suppressed
+_room_pending   = {}       # code -> [{id,title,source,path,url,yt_page_url,added_by,suggested_at,timer,cancelled}]
 
 
 def _new_id():
@@ -570,6 +571,23 @@ def api_room_create():
     return jsonify({"code": code})
 
 
+@app.route("/api/discover")
+def api_discover():
+    with _room_lock:
+        rooms = []
+        for code, room in _rooms.items():
+            mc = len(_room_clients.get(code, []))
+            q = room["queue"]
+            idx = room["current_idx"]
+            now_playing = q[idx]["title"] if room["playing"] and idx < len(q) else None
+            rooms.append({
+                "code": code, "member_count": mc,
+                "now_playing": now_playing, "playing": room["playing"],
+                "created_at": room["created_at"],
+            })
+    return jsonify({"rooms": rooms})
+
+
 @app.route("/api/room/<code>/state")
 def api_room_state(code):
     if code not in _rooms:
@@ -577,6 +595,7 @@ def api_room_state(code):
     room = _rooms[code]
     with _room_lock:
         mc = len(_room_clients.get(code, []))
+        pending_raw = list(_room_pending.get(code, []))
     idx = room["current_idx"]
     q = room["queue"]
     current_title = q[idx]["title"] if idx < len(q) else None
@@ -589,6 +608,8 @@ def api_room_state(code):
         "member_count": mc,
         "queue": [{"id": it["id"], "title": it["title"],
                    "source": it["source"], "added_by": it["added_by"]} for it in q],
+        "pending": [{"id": p["id"], "title": p["title"], "added_by": p["added_by"],
+                     "suggested_at": p["suggested_at"]} for p in pending_raw],
     })
 
 
@@ -665,6 +686,83 @@ def api_room_queue_remove(code, item_id):
     if removed_idx < room["current_idx"]:
         room["current_idx"] = max(0, room["current_idx"] - 1)
     return jsonify({"message": "Removed."})
+
+
+@app.route("/api/room/<code>/suggest", methods=["POST"])
+def api_room_suggest(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    is_host = request.remote_addr in ("127.0.0.1", "::1")
+
+    if "file" in request.files:
+        f = request.files["file"]
+        if not f or not f.filename:
+            return jsonify({"error": "No file."}), 400
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in (".mp3", ".wav", ".flac", ".ogg"):
+            return jsonify({"error": f'Format "{ext}" not supported.'}), 400
+        added_by = "Host" if is_host else (request.form.get("name") or "").strip() or request.remote_addr
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        f.save(tmp.name); tmp.close()
+        item = {
+            "id": _new_id(), "title": f.filename, "source": "file",
+            "path": tmp.name, "url": None, "yt_page_url": None,
+            "added_by": added_by, "suggested_at": time.time(),
+            "cancelled": False, "timer": None,
+        }
+    else:
+        body = request.get_json(silent=True) or {}
+        url = (body.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "No URL provided."}), 400
+        added_by = "Host" if is_host else (body.get("name") or "").strip() or request.remote_addr
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "format": "bestaudio/best"}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get("title") or url
+                stream_url = info.get("url") or (info.get("formats") or [{}])[-1].get("url") or url
+        except Exception as exc:
+            return jsonify({"error": f"Could not resolve YouTube URL: {exc}"}), 400
+        item = {
+            "id": _new_id(), "title": title, "source": "youtube",
+            "path": None, "url": stream_url, "yt_page_url": url,
+            "added_by": added_by, "suggested_at": time.time(),
+            "cancelled": False, "timer": None,
+        }
+
+    def _auto_queue(item_id):
+        with _room_lock:
+            pending = _room_pending.get(code, [])
+            found = next((p for p in pending if p["id"] == item_id), None)
+            if found and not found["cancelled"]:
+                pending.remove(found)
+                _rooms[code]["queue"].append({k: v for k, v in found.items()
+                                              if k not in ("timer", "cancelled", "suggested_at")})
+                print(f"[Room {code}] Auto-queued: {found['title']}", flush=True)
+
+    t = threading.Timer(5.0, _auto_queue, args=[item["id"]])
+    item["timer"] = t
+    with _room_lock:
+        _room_pending.setdefault(code, []).append(item)
+    t.start()
+    print(f"[Room {code}] Suggestion pending 5s: {item['title']} by {item['added_by']}", flush=True)
+    return jsonify({"ok": True, "id": item["id"],
+                    "message": f'"{item["title"]}" will be added in 5s unless cancelled.'})
+
+
+@app.route("/api/room/<code>/suggest/<item_id>/cancel", methods=["POST"])
+def api_room_suggest_cancel(code, item_id):
+    with _room_lock:
+        pending = _room_pending.get(code, [])
+        found = next((p for p in pending if p["id"] == item_id), None)
+        if not found:
+            return jsonify({"error": "Suggestion not found or already queued."}), 404
+        found["cancelled"] = True
+        found["timer"].cancel()
+        pending.remove(found)
+    print(f"[Room {code}] Suggestion cancelled: {found['title']}", flush=True)
+    return jsonify({"ok": True, "message": "Suggestion cancelled."})
 
 
 @app.route("/api/room/<code>/play", methods=["POST"])
@@ -800,6 +898,11 @@ def join_room(code):
     return render_template_string(JOIN_HTML, code=code)
 
 
+@app.route("/pair")
+def pair_page():
+    return render_template_string(PAIR_HTML)
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
@@ -908,6 +1011,9 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
   <div class="nav" onclick="switchTab('room',this)">
     <span class="nav-icon">&#127968;</span><span class="nav-label">Room</span>
   </div>
+  <a class="nav" href="/pair" style="text-decoration:none;color:inherit;margin-top:auto">
+    <span class="nav-icon">&#128246;</span><span class="nav-label">Pair</span>
+  </a>
 </nav>
 
 <main class="main">
@@ -1020,6 +1126,16 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
         </button>
         <div class="hint">Pauses audio for everyone in the room. Press again to resume.</div>
       </div>
+    </div>
+
+    <!-- Pending suggestions -->
+    <div class="card" id="r-pending-card" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span class="ct" style="margin-bottom:0">&#8987; Pending</span>
+        <span id="r-pending-count" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <div id="r-pending-list"></div>
+      <div class="hint">Members' suggestions — cancel within 5s or they auto-join the queue.</div>
     </div>
 
     <!-- Playlist / Queue -->
@@ -1273,6 +1389,31 @@ function renderQueue(q, currentIdx, playing) {
   });
 }
 
+async function cancelRoomSuggest(id) {
+  if (!_rCode) return;
+  await api('/api/room/'+_rCode+'/suggest/'+id+'/cancel', {method:'POST'});
+  pollState();
+}
+function renderRoomPending(pending) {
+  const card = $('r-pending-card'), list = $('r-pending-list');
+  if (!pending || !pending.length) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  $('r-pending-count').textContent = pending.length + ' waiting';
+  const now = Date.now() / 1000;
+  list.innerHTML = '';
+  pending.forEach(p => {
+    const secs = Math.max(0, Math.ceil(5 - (now - p.suggested_at)));
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)';
+    div.innerHTML =
+      '<div style="min-width:26px;height:26px;border-radius:50%;background:#2563eb;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center">'+secs+'</div>'+
+      '<div style="flex:1"><div style="font-size:13px;font-weight:600">'+esc(p.title)+'</div>'+
+      '<div style="font-size:11px;color:var(--muted)">by '+esc(p.added_by)+'</div></div>'+
+      '<button class="btn br" style="padding:4px 10px;font-size:12px" onclick="cancelRoomSuggest(\''+p.id+'\')">Cancel</button>';
+    list.appendChild(div);
+  });
+}
+
 async function pollState() {
   if (!_rCode) return;
   const { ok, data } = await api('/api/room/'+_rCode+'/state');
@@ -1285,6 +1426,7 @@ async function pollState() {
   $('r-now').textContent = data.current_title || '—';
   if (data.paused !== _meetingOn) { _meetingOn = data.paused; setMeetingBtn(data.paused); }
   renderQueue(data.queue, data.current_idx, data.playing);
+  renderRoomPending(data.pending || []);
 }
 function startPoll() {
   clearInterval(_pollTimer);
@@ -1293,6 +1435,120 @@ function startPoll() {
 }
 
 loadDevices();
+</script>
+</body>
+</html>"""
+
+
+PAIR_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pair Device</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,Helvetica,sans-serif;background:#0f172a;color:#f1f5f9;
+     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:32px 16px}
+h1{font-size:22px;font-weight:800;color:#f8fafc;margin-bottom:4px;text-align:center}
+.sub{font-size:13px;color:#64748b;margin-bottom:36px;text-align:center}
+.sonar{position:relative;width:200px;height:200px;display:flex;align-items:center;
+       justify-content:center;margin-bottom:28px}
+.ring{position:absolute;width:200px;height:200px;border-radius:50%;
+      border:2px solid rgba(96,165,250,.5);animation:sonar 2.4s ease-out infinite}
+.ring:nth-child(2){animation-delay:.8s}
+.ring:nth-child(3){animation-delay:1.6s}
+@keyframes sonar{0%{transform:scale(.35);opacity:1}100%{transform:scale(1);opacity:0}}
+.cicon{width:84px;height:84px;border-radius:50%;background:#1e3a5f;
+       border:3px solid #3b82f6;display:flex;align-items:center;justify-content:center;
+       font-size:34px;z-index:1;box-shadow:0 0 0 10px rgba(59,130,246,.1)}
+.disc-txt{font-size:13px;color:#64748b;margin-bottom:24px;text-align:center;min-height:18px}
+.rooms{width:100%;max-width:400px}
+.rcard{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:16px 20px;
+       margin-bottom:12px;cursor:pointer;transition:border-color .15s,background .15s;
+       text-decoration:none;display:block;color:inherit}
+.rcard:hover{border-color:#3b82f6;background:#1e3a5f}
+.rcard-code{font-size:24px;font-weight:900;letter-spacing:.12em;color:#60a5fa}
+.rcard-meta{font-size:12px;color:#64748b;margin-top:4px;display:flex;gap:8px;flex-wrap:wrap}
+.rcard-now{font-size:13px;color:#94a3b8;margin-top:6px;font-style:italic}
+.badge{display:inline-block;background:#0f172a;border:1px solid #334155;
+       border-radius:999px;padding:2px 10px;font-size:11px;color:#94a3b8}
+.empty{text-align:center;color:#475569;font-size:14px;padding:20px 0}
+.manual{margin-top:20px;width:100%;max-width:400px;text-align:center}
+.txtin{width:100%;padding:10px 14px;border:1px solid #334155;border-radius:8px;
+       font-size:20px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;
+       text-align:center;background:#1e293b;color:#f8fafc;margin-bottom:10px}
+.txtin::placeholder{color:#475569;font-weight:400;font-size:14px;letter-spacing:0;text-transform:none}
+.btn{width:100%;padding:11px;border:none;border-radius:8px;background:#2563eb;color:#fff;
+     font-size:14px;font-weight:700;cursor:pointer}
+.btn:hover{filter:brightness(90%)}
+.divider{font-size:12px;color:#475569;margin:16px 0}
+</style>
+</head>
+<body>
+<h1>Find a Room</h1>
+<p class="sub">Rooms on your WiFi appear below automatically</p>
+
+<div class="sonar">
+  <div class="ring"></div>
+  <div class="ring"></div>
+  <div class="ring"></div>
+  <div class="cicon">&#127925;</div>
+</div>
+<div class="disc-txt" id="disc-txt">Discovering rooms&hellip;</div>
+
+<div class="rooms" id="rooms-list"></div>
+
+<div class="manual">
+  <div class="divider">— or enter room code manually —</div>
+  <input class="txtin" type="text" id="man-code" maxlength="4" placeholder="e.g. PLAY"
+         oninput="this.value=this.value.toUpperCase().replace(/[^A-Z]/g,'')"
+         onkeydown="if(event.key==='Enter')manualJoin()">
+  <button class="btn" onclick="manualJoin()">Join Room &rarr;</button>
+</div>
+
+<script>
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function manualJoin(){
+  const c=document.getElementById('man-code').value.trim();
+  if(c.length===4)window.location='/join/'+c;
+}
+async function discover(){
+  try{
+    const r=await fetch('/api/discover');
+    const data=await r.json();
+    const rooms=data.rooms||[];
+    const box=document.getElementById('rooms-list');
+    const txt=document.getElementById('disc-txt');
+    if(!rooms.length){
+      box.innerHTML='<div class="empty">No rooms found yet&hellip; Ask the host to create one.</div>';
+      txt.textContent='Searching…';
+    }else{
+      txt.textContent=rooms.length+' room'+(rooms.length===1?'':'s')+' found on this network';
+      box.innerHTML='';
+      rooms.forEach(rm=>{
+        const a=document.createElement('a');
+        a.className='rcard';
+        a.href='/join/'+rm.code;
+        const m=rm.member_count||0;
+        a.innerHTML=
+          '<div class="rcard-code">'+rm.code+'</div>'+
+          '<div class="rcard-meta">'+
+            '<span class="badge">'+m+' listener'+(m===1?'':'s')+'</span>'+
+            (rm.playing
+              ?'<span class="badge" style="color:#22c55e;border-color:#22c55e">&#9679; Live</span>'
+              :'<span class="badge">Idle</span>')+
+          '</div>'+
+          (rm.now_playing
+            ?'<div class="rcard-now">&#9654; '+esc(rm.now_playing)+'</div>'
+            :'<div class="rcard-now" style="color:#475569">Waiting for host&hellip;</div>');
+        box.appendChild(a);
+      });
+    }
+  }catch(e){}
+  setTimeout(discover,2000);
+}
+discover();
 </script>
 </body>
 </html>"""
@@ -1341,6 +1597,14 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
 .qi-t{flex:1;font-weight:500}
 .qi-now{font-size:11px;color:#60a5fa;margin-left:6px}
 .hint{font-size:12px;color:#475569;margin-top:6px}
+.sug-banner{background:#1e3a5f;border:1px solid #3b82f6;border-radius:10px;
+  padding:10px 12px;margin-bottom:8px;display:flex;align-items:center;gap:10px}
+.sug-cd{min-width:26px;height:26px;border-radius:50%;background:#2563eb;color:#fff;
+  font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sug-title{flex:1;font-size:13px;font-weight:600;color:#f8fafc}
+.sug-by{font-size:11px;color:#93c5fd}
+.sug-cancel{padding:5px 10px;border:none;border-radius:6px;background:#dc2626;
+  color:#fff;font-size:12px;font-weight:700;cursor:pointer;flex-shrink:0}
 </style>
 </head>
 <body>
@@ -1398,18 +1662,28 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
   </div>
 
   <div class="card">
-    <div class="ct">Add to Playlist</div>
+    <div class="ct">Suggest a Song</div>
     <div class="frow">
       <input type="file" id="j-file" accept=".mp3,.wav,.flac,.ogg" style="flex:1;min-width:0;color:#94a3b8">
-      <button class="btn bb" onclick="jAddFile()">&#43; Add</button>
+      <button class="btn bb" onclick="jSuggestFile()">&#43; Suggest</button>
     </div>
     <hr style="border:none;border-top:1px solid #334155;margin:10px 0">
     <div class="frow">
       <input class="txtin" type="text" id="j-yt" placeholder="YouTube URL">
-      <button class="btn br" id="j-yt-btn" onclick="jAddYT()">&#43; Add</button>
+      <button class="btn br" id="j-yt-btn" onclick="jSuggestYT()">&#43; Suggest</button>
     </div>
-    <div class="hint">Your song plays after the current queue.</div>
+    <div class="hint">Anyone can cancel within 5 seconds &mdash; then it joins the queue.</div>
     <div class="msg" id="j-msg"></div>
+  </div>
+
+  <!-- Pending suggestions -->
+  <div class="card" id="j-pending-card" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <span class="ct" style="margin-bottom:0">&#8987; Pending</span>
+      <span id="j-pending-count" style="font-size:12px;color:#64748b"></span>
+    </div>
+    <div id="j-pending-list"></div>
+    <div class="hint">Tap Cancel to stop a song from joining the queue.</div>
   </div>
 
   <div class="card">
@@ -1453,27 +1727,52 @@ async function api(url,opts){
   }catch(e){return{ok:false,data:{error:'Network error: '+e}};}
 }
 
-async function jAddFile(){
+async function jSuggestFile(){
   const inp=document.getElementById('j-file');
   if(!inp.files.length){showMsg('Choose a file first.','err');return;}
   const fd=new FormData();fd.append('file',inp.files[0]);fd.append('name',myName());
-  showMsg('Adding&hellip;','ok');
-  const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{method:'POST',body:fd});
+  showMsg('Suggesting&hellip;','ok');
+  const{ok,data}=await api('/api/room/'+CODE+'/suggest',{method:'POST',body:fd});
   showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
   if(ok){inp.value='';pollState();}
 }
-async function jAddYT(){
+async function jSuggestYT(){
   const url=document.getElementById('j-yt').value.trim();
   if(!url){showMsg('Paste a YouTube URL.','err');return;}
   document.getElementById('j-yt-btn').disabled=true;
   showMsg('Resolving&hellip; (~2&ndash;5 s)','ok');
-  const{ok,data}=await api('/api/room/'+CODE+'/queue/add',{
+  const{ok,data}=await api('/api/room/'+CODE+'/suggest',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({url,name:myName()})
   });
   document.getElementById('j-yt-btn').disabled=false;
   showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
   if(ok){document.getElementById('j-yt').value='';pollState();}
+}
+async function cancelSuggest(id){
+  const{ok,data}=await api('/api/room/'+CODE+'/suggest/'+id+'/cancel',{method:'POST'});
+  showMsg(esc(ok?data.message:(data.error||'Failed.')),ok?'ok':'err');
+  pollState();
+}
+function renderPending(pending){
+  const card=document.getElementById('j-pending-card');
+  const list=document.getElementById('j-pending-list');
+  if(!pending||!pending.length){card.style.display='none';return;}
+  card.style.display='block';
+  document.getElementById('j-pending-count').textContent=pending.length+' waiting';
+  const now=Date.now()/1000;
+  list.innerHTML='';
+  pending.forEach(p=>{
+    const secs=Math.max(0,Math.ceil(5-(now-p.suggested_at)));
+    const div=document.createElement('div');
+    div.className='sug-banner';
+    div.innerHTML=
+      '<div class="sug-cd">'+secs+'</div>'+
+      '<div style="flex:1"><div class="sug-title">'+esc(p.title)+'</div>'+
+      '<div class="sug-by">by '+esc(p.added_by)+'</div></div>'+
+      '<button class="sug-cancel" onclick="cancelSuggest(\''+p.id+'\')">Cancel</button>';
+    list.appendChild(div);
+  });
 }
 
 function jSrcIcon(src){
@@ -1508,6 +1807,7 @@ async function pollState(){
   const nowTitle=document.getElementById('now-title');
 
   renderQueue(data.queue,data.current_idx,data.playing);
+  renderPending(data.pending||[]);
 
   if(data.paused){
     if(_playing){
