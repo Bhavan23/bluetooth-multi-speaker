@@ -48,7 +48,8 @@ _room_ffmpeg    = {}   # code -> Popen
 _room_readers   = {}   # code -> Thread
 _room_lock      = threading.Lock()
 _room_no_advance = set()   # codes where auto-advance is suppressed
-_room_pending   = {}       # code -> [{id,title,source,path,url,yt_page_url,added_by,suggested_at,timer,cancelled}]
+_room_pending     = {}     # code -> [{id,title,source,path,url,yt_page_url,added_by,suggested_at,timer,cancelled}]
+_room_live_clients = {}   # code -> [queue.Queue]  live-stream listeners (member share)
 
 
 def _new_id():
@@ -565,7 +566,8 @@ def api_room_create():
         if code in _rooms:
             return jsonify({"error": f'Room "{code}" already exists. Choose a different code.'}), 400
         _rooms[code] = {"code": code, "playing": False,
-                        "current_idx": 0, "queue": [], "created_at": time.time()}
+                        "current_idx": 0, "queue": [], "created_at": time.time(),
+                        "live_source": None, "live_by": None}
         _room_clients[code] = []
     print(f"Room created: {code}", flush=True)
     return jsonify({"code": code})
@@ -598,7 +600,14 @@ def api_room_state(code):
         pending_raw = list(_room_pending.get(code, []))
     idx = room["current_idx"]
     q = room["queue"]
-    current_title = q[idx]["title"] if idx < len(q) else None
+    live_source = room.get("live_source")
+    live_by = room.get("live_by")
+    if live_source == "host":
+        current_title = "System Audio (Live)"
+    elif live_source == "member":
+        current_title = f"{live_by} is sharing audio (Live)"
+    else:
+        current_title = q[idx]["title"] if idx < len(q) else None
     return jsonify({
         "code": code,
         "playing": room["playing"],
@@ -606,6 +615,8 @@ def api_room_state(code):
         "current_idx": idx,
         "current_title": current_title,
         "member_count": mc,
+        "live_source": live_source,
+        "live_by": live_by,
         "queue": [{"id": it["id"], "title": it["title"],
                    "source": it["source"], "added_by": it["added_by"]} for it in q],
         "pending": [{"id": p["id"], "title": p["title"], "added_by": p["added_by"],
@@ -859,6 +870,139 @@ def api_room_resume(code):
     _room_start_item(code, room["current_idx"])
     return jsonify({"message": "Resumed."})
 
+
+# ── Live audio share ───────────────────────────────────────────────────────────
+
+@app.route("/api/room/<code>/live/host", methods=["POST"])
+def api_room_live_host(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    try:
+        exe = _ffmpeg_exe()
+    except Exception as exc:
+        return jsonify({"error": f"FFmpeg unavailable: {exc}"}), 500
+
+    # WASAPI loopback: capture all system audio playing on this Windows PC
+    proc = subprocess.Popen(
+        [exe, "-f", "wasapi", "-loopback", "-i", "dummy",
+         "-f", "mp3", "-ab", "128k", "-ar", "44100", "-ac", "2", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    _room_ffmpeg[code] = proc
+    _rooms[code]["playing"] = True
+    _rooms[code]["live_source"] = "host"
+    _rooms[code]["live_by"] = "Host"
+
+    def reader():
+        try:
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                with _room_lock:
+                    clients = list(_room_clients.get(code, []))
+                for cq in clients:
+                    try: cq.put_nowait(chunk)
+                    except queue.Full: pass
+        finally:
+            with _room_lock:
+                clients = list(_room_clients.get(code, []))
+            for cq in clients:
+                try: cq.put_nowait(None)
+                except Exception: pass
+            if code in _rooms:
+                _rooms[code]["playing"] = False
+                _rooms[code]["live_source"] = None
+                _rooms[code]["live_by"] = None
+            print(f"[Room {code}] Host live audio ended.", flush=True)
+
+    t = threading.Thread(target=reader, daemon=True)
+    _room_readers[code] = t
+    t.start()
+    print(f"[Room {code}] Host started system audio loopback.", flush=True)
+    return jsonify({"ok": True, "message": "Streaming system audio to all members."})
+
+
+@app.route("/api/room/<code>/live/member-start", methods=["POST"])
+def api_room_live_member_start(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "Member").strip()
+    _room_stop_internal(code)
+    _room_no_advance.discard(code)
+    with _room_lock:
+        _rooms[code]["live_source"] = "member"
+        _rooms[code]["live_by"] = name
+        _rooms[code]["playing"] = False
+        _room_live_clients[code] = []
+    print(f"[Room {code}] Member '{name}' started live audio share.", flush=True)
+    return jsonify({"ok": True, "message": f"{name} is now sharing audio."})
+
+
+@app.route("/api/room/<code>/live/chunk", methods=["POST"])
+def api_room_live_chunk(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    if _rooms[code].get("live_source") != "member":
+        return jsonify({"error": "Not in member live mode."}), 400
+    data = request.get_data()
+    if data:
+        with _room_lock:
+            clients = list(_room_live_clients.get(code, []))
+        for cq in clients:
+            try: cq.put_nowait(data)
+            except queue.Full: pass
+    return "", 204
+
+
+@app.route("/api/room/<code>/live/stop", methods=["POST"])
+def api_room_live_stop(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    live_source = _rooms[code].get("live_source")
+    if live_source == "host":
+        _room_stop_internal(code)
+    with _room_lock:
+        _rooms[code]["live_source"] = None
+        _rooms[code]["live_by"] = None
+        for cq in _room_live_clients.get(code, []):
+            try: cq.put_nowait(None)
+            except Exception: pass
+        _room_live_clients[code] = []
+    print(f"[Room {code}] Live audio stopped.", flush=True)
+    return jsonify({"ok": True, "message": "Live audio stopped."})
+
+
+@app.route("/room/<code>/live-stream")
+def room_live_stream(code):
+    if code not in _rooms:
+        return jsonify({"error": "Room not found"}), 404
+    client_q = queue.Queue(maxsize=400)
+    with _room_lock:
+        _room_live_clients.setdefault(code, []).append(client_q)
+
+    def generate():
+        try:
+            while True:
+                try:
+                    chunk = client_q.get(timeout=30)
+                    if chunk is None:
+                        break
+                    yield chunk
+                except queue.Empty:
+                    break
+        finally:
+            with _room_lock:
+                ql = _room_live_clients.get(code, [])
+                if client_q in ql:
+                    ql.remove(client_q)
+
+    return Response(stream_with_context(generate()),
+                    mimetype="audio/webm",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Room HTTP stream ───────────────────────────────────────────────────────────
@@ -1118,6 +1262,18 @@ h2{font-size:18px;font-weight:700;margin-bottom:18px}
         <button class="btn bam" onclick="rSkip()">&#9197; Skip</button>
         <button class="btn br"  onclick="rStopRoom()">&#9646;&#9646; Stop Room</button>
         <button class="btn" style="background:#0891b2;color:#fff" onclick="rSync()" title="Restart current song for all members">&#8635; Sync All</button>
+      </div>
+      <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px;margin-bottom:8px">
+        <div id="r-live-bar" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;color:#92400e;display:none;align-items:center;gap:8px">
+          <span style="color:#dc2626;font-size:16px">&#9679;</span>
+          <span id="r-live-label">Live</span>
+          <button class="btn br" style="padding:4px 10px;font-size:12px;margin-left:auto" onclick="rLiveStop()">Stop Live</button>
+        </div>
+        <button class="btn" id="r-live-btn" onclick="rLiveHost()"
+          style="background:#7c3aed;color:#fff;width:100%;font-size:13px">
+          &#127911; Share System Audio
+        </button>
+        <div class="hint">Streams whatever is playing on this PC to all members.</div>
       </div>
       <div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">
         <button class="btn" id="r-meeting-btn" onclick="rToggleMeeting()"
@@ -1389,6 +1545,29 @@ function renderQueue(q, currentIdx, playing) {
   });
 }
 
+let _hostLiveOn = false;
+async function rLiveHost() {
+  if (!_rCode) return;
+  if (_hostLiveOn) { await rLiveStop(); return; }
+  showMsg('msg-room', 'Starting system audio capture&hellip;', 'ok');
+  const { ok, data } = await api('/api/room/'+_rCode+'/live/host', {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+  if (ok) { _hostLiveOn = true; setLiveBar(true, 'System Audio (Live)'); }
+}
+async function rLiveStop() {
+  if (!_rCode) return;
+  const { ok, data } = await api('/api/room/'+_rCode+'/live/stop', {method:'POST'});
+  showMsg('msg-room', esc(ok ? data.message : (data.error||'Failed.')), ok?'ok':'err');
+  _hostLiveOn = false; setLiveBar(false, '');
+}
+function setLiveBar(on, label) {
+  const bar = $('r-live-bar'), btn = $('r-live-btn');
+  bar.style.display = on ? 'flex' : 'none';
+  if (on) $('r-live-label').textContent = label;
+  btn.textContent = on ? '\u{1F3B5} Live Active' : '\u{1F3B5} Share System Audio';
+  btn.style.background = on ? '#dc2626' : '#7c3aed';
+}
+
 async function cancelRoomSuggest(id) {
   if (!_rCode) return;
   await api('/api/room/'+_rCode+'/suggest/'+id+'/cancel', {method:'POST'});
@@ -1427,6 +1606,11 @@ async function pollState() {
   if (data.paused !== _meetingOn) { _meetingOn = data.paused; setMeetingBtn(data.paused); }
   renderQueue(data.queue, data.current_idx, data.playing);
   renderRoomPending(data.pending || []);
+  if (data.live_source && data.live_source !== 'host') {
+    setLiveBar(true, (data.live_by||'Member') + ' is sharing (Live)');
+  } else if (!data.live_source && !_hostLiveOn) {
+    setLiveBar(false, '');
+  }
 }
 function startPoll() {
   clearInterval(_pollTimer);
@@ -1654,6 +1838,20 @@ audio{width:100%;border-radius:8px;margin-bottom:10px}
     </div>
   </div>
 
+  <!-- Live audio share -->
+  <div class="card" id="j-live-card">
+    <div class="ct">Share Your Audio</div>
+    <div id="j-live-bar" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:13px;color:#92400e;align-items:center;gap:8px">
+      <span style="color:#dc2626;font-size:16px">&#9679;</span>
+      <span id="j-live-label">Live</span>
+    </div>
+    <button id="j-share-btn" onclick="toggleMemberShare()"
+      style="width:100%;padding:10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-size:14px;font-weight:700;cursor:pointer">
+      &#127911; Share My Audio
+    </button>
+    <div class="hint" style="margin-top:6px">Your browser will ask you to pick a tab or window &mdash; choose &ldquo;Share audio&rdquo;. Everyone in the room hears it.</div>
+  </div>
+
   <div class="card">
     <div class="ct">Your Name</div>
     <input class="txtin" type="text" id="j-name" placeholder="Enter your name (shown on playlist)"
@@ -1799,6 +1997,46 @@ function renderQueue(q,idx,playing){
   });
 }
 
+let _memberShareOn = false, _mediaRecorder = null, _shareStream = null;
+async function toggleMemberShare(){
+  if(_memberShareOn){ await stopMemberShare(); return; }
+  try{
+    const stream = await navigator.mediaDevices.getDisplayMedia({audio:true,video:false});
+    _shareStream = stream;
+    await api('/api/room/'+CODE+'/live/member-start',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:myName()})
+    });
+    _mediaRecorder = new MediaRecorder(stream, {mimeType:'audio/webm;codecs=opus'});
+    _mediaRecorder.ondataavailable = async e => {
+      if(e.data && e.data.size > 0){
+        await fetch('/api/room/'+CODE+'/live/chunk',{method:'POST',body:e.data,headers:{'Content-Type':'audio/webm'}});
+      }
+    };
+    _mediaRecorder.onstop = () => stopMemberShare();
+    stream.getAudioTracks()[0].onended = () => stopMemberShare();
+    _mediaRecorder.start(250);
+    _memberShareOn = true;
+    const btn = document.getElementById('j-share-btn');
+    btn.textContent = '⏹ Stop Sharing';
+    btn.style.background = '#dc2626';
+    const bar = document.getElementById('j-live-bar');
+    bar.style.display = 'flex';
+    document.getElementById('j-live-label').textContent = 'You are sharing audio live';
+  }catch(e){
+    if(e.name!=='NotAllowedError') showMsg('Could not capture audio: '+e.message,'err');
+  }
+}
+async function stopMemberShare(){
+  if(_mediaRecorder && _mediaRecorder.state!=='inactive') _mediaRecorder.stop();
+  if(_shareStream) _shareStream.getTracks().forEach(t=>t.stop());
+  _mediaRecorder=null; _shareStream=null; _memberShareOn=false;
+  await api('/api/room/'+CODE+'/live/stop',{method:'POST'});
+  const btn=document.getElementById('j-share-btn');
+  btn.textContent='\u{1F3B5} Share My Audio'; btn.style.background='#7c3aed';
+  document.getElementById('j-live-bar').style.display='none';
+}
+
 async function pollState(){
   const{ok,data}=await api('/api/room/'+CODE+'/state');
   if(!ok){document.getElementById('status-txt').textContent='Room not found.';return;}
@@ -1808,6 +2046,24 @@ async function pollState(){
 
   renderQueue(data.queue,data.current_idx,data.playing);
   renderPending(data.pending||[]);
+
+  // Live audio from another member — switch to live-stream endpoint
+  if(data.live_source==='member'&&!_memberShareOn){
+    const bar=document.getElementById('j-live-bar');
+    bar.style.display='flex';
+    document.getElementById('j-live-label').textContent=(data.live_by||'Member')+' is sharing live';
+    if(!_playing&&_tapped){
+      _playing=true;
+      player.src='/room/'+CODE+'/live-stream?t='+Date.now();
+      player.play().catch(()=>{});
+    }
+  } else if(!data.live_source&&!_memberShareOn){
+    document.getElementById('j-live-bar').style.display='none';
+    // if we were on live-stream, drop back to queue
+    if(_playing&&player.src&&player.src.includes('live-stream')){
+      _playing=false; player.pause(); player.src='';
+    }
+  }
 
   if(data.paused){
     if(_playing){
